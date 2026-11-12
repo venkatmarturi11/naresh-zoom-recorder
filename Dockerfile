@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PULSE_RUNTIME_PATH=/tmp/pulse
 
-# Virtual display, virtual audio, encoder, cursor hiding
+# Virtual display, virtual audio, encoder, cursor hiding, build tools for tgcrypto
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         pulseaudio \
@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         unclutter \
         x11-utils \
         ca-certificates \
+        gcc \
+        libc6-dev \
+        python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
