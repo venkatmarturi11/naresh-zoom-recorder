@@ -386,9 +386,11 @@ async def login(page) -> None:
     except PWTimeout:
         raise RuntimeError("Portal login appears to have failed (password field still visible)")
     log("Logged in to portal")
+    await dismiss_popups(page)
 
 
 async def open_todays_classes(page) -> None:
+    await dismiss_popups(page)
     try:
         await page.get_by_text(re.compile(r"Live\s*Classes", re.I)).first.click(timeout=8000)
     except Exception:
@@ -399,6 +401,7 @@ async def open_todays_classes(page) -> None:
         pass  # may already be the default tab
     await page.wait_for_load_state("domcontentloaded")
     await asyncio.sleep(1.0)
+    await dismiss_popups(page)
 
 
 def card_locator(page):
@@ -613,8 +616,7 @@ async def zoom_prejoin(zp) -> None:
             clicked_join = True
             break
         await click_browser_join(zp)
-        await click_any(zp, [r"^accept cookies", r"^accept all", r"^i agree$"])
-        await click_any(zp, [r"continue without (audio|microphone)"])
+        await dismiss_popups(zp)
         await ensure_muted(zp)
 
         for frame in zp.frames:
@@ -649,8 +651,38 @@ async def zoom_prejoin(zp) -> None:
         log("Join button on the pre-join screen was not found; continuing anyway")
 
 
+POPUP_PATTERNS = [
+    r"^got it$",
+    r"^ok$",
+    r"^i agree$",
+    r"^i understand$",
+    r"^accept( all)?( cookies)?$",
+    r"^allow( all)?( cookies)?$",
+    r"^dismiss$",
+    r"^skip$",
+    r"^not now$",
+    r"^maybe later$",
+    r"^no,? thanks$",
+    r"^continue without (audio|microphone)$",
+    r"^continue$",
+]
+
+
 async def dismiss_popups(zp) -> None:
-    await click_any(zp, [r"^got it$", r"^ok$", r"^i agree$", r"^dismiss$"])
+    await click_any(zp, POPUP_PATTERNS)
+    for frame in zp.frames:
+        try:
+            close_btn = frame.locator(
+                "[role='dialog'] button[aria-label*='close' i], "
+                ".zm-modal button[aria-label*='close' i], "
+                "button[aria-label='Close' i]"
+            ).first
+            if await close_btn.count() and await close_btn.is_visible():
+                label = (await close_btn.get_attribute("aria-label") or "").lower()
+                if not re.search(r"leave|end|exit", label):
+                    await close_btn.click(timeout=800)
+        except Exception:
+            continue
 
 
 async def in_meeting(zp) -> bool:
@@ -764,7 +796,7 @@ async def monitor(zp, started: float) -> str:
             if failures > 20:
                 return "page became unreachable"
 
-        if time.monotonic() - last_housekeeping > 30:
+        if time.monotonic() - last_housekeeping > 10:
             last_housekeeping = time.monotonic()
             await dismiss_popups(zp)
             await inject_hide_css(zp)
@@ -904,6 +936,17 @@ async def main() -> int:
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
             )
+            async def _dismiss_dialog(d):
+                try:
+                    await d.dismiss()
+                except Exception:
+                    pass
+
+            def _attach_dialog_handler(p):
+                p.on("dialog", lambda d: asyncio.create_task(_dismiss_dialog(d)))
+            context.on("page", _attach_dialog_handler)
+            for p in context.pages:
+                _attach_dialog_handler(p)
             page = context.pages[0] if context.pages else await context.new_page()
             try:
                 await login(page)
