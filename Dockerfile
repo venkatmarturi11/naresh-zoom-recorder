@@ -28,6 +28,11 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 COPY recorder.py .
 RUN chown -R pwuser:pwuser /app
 
+# Block external Zoom app protocol prompts (Open xdg-open?) at policy level
+RUN mkdir -p /etc/chromium/policies/managed /etc/opt/chrome/policies/managed \
+    && echo '{"URLBlocklist":["zoommtg://*","zoomus://*"]}' > /etc/chromium/policies/managed/block_zoom.json \
+    && cp /etc/chromium/policies/managed/block_zoom.json /etc/opt/chrome/policies/managed/block_zoom.json
+
 # PulseAudio refuses to run as root, so run as the non-root user
 # that ships with the Playwright image.
 USER pwuser

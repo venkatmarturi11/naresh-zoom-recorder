@@ -10,9 +10,11 @@ Pipeline:  Xvfb + PulseAudio -> Chromium (Playwright) -> portal login ->
 All configuration comes from environment variables (GitHub Secrets).
 """
 import asyncio
+import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -624,8 +626,22 @@ async def zoom_prejoin(zp) -> None:
             except Exception:
                 continue
 
-        if await click_any(zp, [r"^join$", r"^join meeting$"]):
+        matched = await click_any(zp, [r"^join$", r"^join meeting$"])
+        if matched:
+            log(f"Clicked pre-join button ({matched})")
             clicked_join = True
+            break
+        for frame in zp.frames:
+            try:
+                jb = frame.locator("button.preview-join-button").first
+                if await jb.count() and await jb.is_visible() and await jb.is_enabled():
+                    await jb.click(timeout=1500)
+                    log("Clicked preview-join-button")
+                    clicked_join = True
+                    break
+            except Exception:
+                continue
+        if clicked_join:
             break
         await asyncio.sleep(1)
 
@@ -647,8 +663,8 @@ async def in_meeting(zp) -> bool:
             loc = frame.locator(
                 "#wc-footer, #foot-bar, [class*='footer-chat'], "
                 "button[aria-label*='Leave' i], button:has-text('Leave'), "
-                "button[aria-label*='Audio' i], button[aria-label*='Participants' i], "
-                "button[aria-label*='Chat' i], #wc-container-left"
+                "button[aria-label*='Participants' i], button[aria-label*='Chat' i], "
+                "button[aria-label*='Reactions' i], button[aria-label*='Share Screen' i]"
             ).first
             if await loc.count() and await loc.is_visible():
                 return True
@@ -862,13 +878,30 @@ async def main() -> int:
         media.start()
         log("Virtual display and audio are ready")
 
+        prof_dir = Path("/tmp/pw-profile")
+        shutil.rmtree(prof_dir, ignore_errors=True)
+        (prof_dir / "Default").mkdir(parents=True, exist_ok=True)
+        (prof_dir / "Default" / "Preferences").write_text(json.dumps({
+            "protocol_handler": {
+                "excluded_schemes": {"zoommtg": True, "zoomus": True, "zoom": True}
+            }
+        }))
+
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=False, args=CHROMIUM_ARGS, ignore_default_args=["--enable-automation"]
-            )
             # permissions=[] hard-blocks microphone and camera
-            context = await browser.new_context(permissions=[], no_viewport=True)
-            page = await context.new_page()
+            context = await pw.chromium.launch_persistent_context(
+                str(prof_dir),
+                headless=False,
+                args=CHROMIUM_ARGS,
+                ignore_default_args=["--enable-automation"],
+                permissions=[],
+                no_viewport=True,
+            )
+            await context.add_init_script(
+                "const _open=window.open;window.open=(u,...a)=>"
+                "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
             try:
                 await login(page)
                 await open_todays_classes(page)
@@ -898,7 +931,7 @@ async def main() -> int:
                 # ALWAYS finalize FFmpeg so the MP4 is valid and uploadable
                 await asyncio.to_thread(recorder.stop)
                 try:
-                    await browser.close()
+                    await context.close()
                 except Exception:
                     pass
     except asyncio.CancelledError:
