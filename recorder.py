@@ -44,6 +44,8 @@ def _env(name: str, default: str = "") -> str:
 
 
 PORTAL_URL = _env("PORTAL_URL")
+if PORTAL_URL and not PORTAL_URL.startswith(("http://", "https://")):
+    PORTAL_URL = "https://" + PORTAL_URL
 PORTAL_USER = _env("PORTAL_USER")
 PORTAL_PASS = _env("PORTAL_PASS")
 TG_API_ID = _env("TG_API_ID")
@@ -577,7 +579,10 @@ async def wait_in_meeting(zp, max_wait: int = 1800) -> None:
 async def join_audio(zp) -> None:
     """Listen-only: join computer audio so we can hear, keep the mic muted."""
     for _ in range(8):
-        if await click_any(zp, [r"join audio by computer"]):
+        if await click_any(
+            zp,
+            [r"join audio by computer", r"join with computer audio", r"computer audio"],
+        ):
             break
         if await click_any(zp, [r"^join audio"]):
             await asyncio.sleep(1)
