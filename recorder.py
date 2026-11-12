@@ -695,6 +695,9 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if not sent_debug and elapsed >= 30:
             sent_debug = True
             await notify_photo(zp, f"⏳ Waiting to enter Zoom ({mask_url(zp.url)})")
+        # If still stuck on the pre-join screen, retry clicking Join periodically
+        if elapsed >= 8 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 10 < 2:
+            await click_any(zp, [r"^join$", r"^join meeting$"])
         await asyncio.sleep(2)
     log("Could not confirm meeting UI; starting the recording anyway")
 
