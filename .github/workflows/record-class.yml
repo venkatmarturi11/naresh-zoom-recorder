@@ -2,8 +2,8 @@ name: Record class
 
 on:
   schedule:
-    # 13:50 UTC = 7:20 PM IST (10 minutes before the 7:30 PM class)
-    - cron: "50 13 * * *"
+    # 13:47 UTC = 7:17 PM IST (off-peak minute; buffer before 7:30 PM class)
+    - cron: "47 13 * * *"
   workflow_dispatch:
     inputs:
       class_keyword:
