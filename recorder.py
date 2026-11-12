@@ -53,8 +53,9 @@ TG_CHAT_ID = _env("TG_CHAT_ID")
 
 CLASS_KEYWORD = _env("CLASS_KEYWORD", "React JS")
 CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
+CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "90"))
 MAX_WAIT_MIN = int(_env("MAX_WAIT_MIN", "45"))  # wait for Join to activate
-MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", "9000"))  # 2.5 h safety limit
+MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", str(CLASS_DURATION_MIN * 60)))  # 90 min default
 PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (PORTAL_USER.split("@")[0] or "Student")
 
 RECORD_PATH = _env("RECORD_PATH", "/tmp/class_recording.mp4")
