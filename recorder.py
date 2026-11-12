@@ -397,6 +397,7 @@ async def wait_and_join(context, page):
     deadline = time.monotonic() + MAX_WAIT_MIN * 60
     last_reload = time.monotonic()
     reloaded_at_start = False
+    early_click_failed = False
     log(f"Waiting for the Join button (class start {CLASS_START} IST)")
 
     while time.monotonic() < deadline:
@@ -407,11 +408,32 @@ async def wait_and_join(context, page):
         except Exception:
             found = False
 
-        if found:
+        if found and (now >= start_dt or not early_click_failed):
             btn = join_button(card)
             if await join_ready(btn):
                 log("Join button is active; clicking")
-                return await click_join(context, page, btn)
+                prev_url = page.url
+                zp = await click_join(
+                    context, page, btn, wait_sec=25 if now >= start_dt else 12
+                )
+                if zp is not None:
+                    return zp
+                if now < start_dt:
+                    early_click_failed = True
+                    log(f"Join did not open Zoom yet; waiting until {CLASS_START} IST")
+                else:
+                    log("Join click did not open Zoom yet; retrying after reload")
+                try:
+                    if page.url != prev_url:
+                        await page.goto(prev_url, wait_until="domcontentloaded")
+                    else:
+                        await page.reload(wait_until="domcontentloaded")
+                    await open_todays_classes(page)
+                except Exception as e:
+                    log(f"Reload hiccup ({type(e).__name__})")
+                last_reload = time.monotonic()
+                await asyncio.sleep(3)
+                continue
 
         since_reload = time.monotonic() - last_reload
         need_reload = False
@@ -440,7 +462,8 @@ async def wait_and_join(context, page):
     )
 
 
-async def click_join(context, page, btn):
+async def click_join(context, page, btn, wait_sec: int = 25):
+    known_pages = set(context.pages)
     try:
         async with context.expect_page(timeout=6000) as new_page_info:
             await btn.click()
@@ -448,14 +471,21 @@ async def click_join(context, page, btn):
     except PWTimeout:
         pass  # same-tab redirect; handled by the URL scan below
 
-    end = time.monotonic() + 30
+    end = time.monotonic() + wait_sec
     while time.monotonic() < end:
         for p in context.pages:
             if re.search(r"zoom\.(us|com)", p.url):
                 log(f"Captured Zoom URL: {mask_url(p.url)}")
                 return p
         await asyncio.sleep(0.5)
-    raise RuntimeError("Zoom URL was not detected after clicking Join")
+
+    for p in list(context.pages):
+        if p not in known_pages and not re.search(r"zoom\.(us|com)", p.url):
+            try:
+                await p.close()
+            except Exception:
+                pass
+    return None
 
 
 # --------------------------------------------------------------------------

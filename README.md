@@ -3,7 +3,7 @@
 Records your daily live class from the student portal on GitHub's free servers
 (no device of your own needed) and sends the 1080p MP4 to your Telegram.
 
-How it works: GitHub Actions starts a container at 7:22 PM IST, logs in to the
+How it works: GitHub Actions starts a container at 7:20 PM IST, logs in to the
 portal, waits for the **Join** button to become active, joins the Zoom web
 client with mic and camera off, records the screen and audio with FFmpeg, then
 uploads the video to Telegram (files over ~1.95 GB are split automatically).
@@ -16,7 +16,7 @@ uploads the video to Telegram (files over ~1.95 GB are split automatically).
 ├── .env.example
 └── .github/workflows/
     ├── build-image.yml     # builds the image once into ghcr.io
-    └── record-class.yml    # daily 7:22 PM IST + manual run
+    └── record-class.yml    # daily 7:20 PM IST + manual run
 ```
 
 ## One-time setup
@@ -66,7 +66,7 @@ Watch the Telegram alerts and the run log. Fix any selector problems (see below)
 - Public repo logs are public. The script masks secrets and meeting-link
   passwords, but never `print` extra details if you edit it.
 - Check that your institute allows recording its classes.
-- To skip Sundays, change the cron to `52 13 * * 1-6`.
+- To skip Sundays, change the cron to `50 13 * * 1-6`.
 
 ## Local test (optional, needs Docker)
 ```bash
