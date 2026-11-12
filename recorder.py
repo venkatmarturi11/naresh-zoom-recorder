@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -90,7 +91,10 @@ END_RE = re.compile(
     r"you have been removed|meeting has ended)",
     re.I,
 )
-WAITING_ROOM_RE = re.compile(r"(host will let you in|waiting room|please wait)", re.I)
+WAITING_ROOM_RE = re.compile(
+    r"(host will let you in|you are in the waiting room|waiting for the host to start)",
+    re.I,
+)
 POST_MEETING_URL_RE = re.compile(r"(postattendee|/wc/leave|/leave\b|/meeting/end)", re.I)
 
 HIDE_CSS = """
@@ -162,6 +166,39 @@ async def notify(text: str) -> None:
         )
     except Exception as e:  # never let a notification break the run
         log(f"Telegram notification failed ({type(e).__name__})")
+
+
+def _bot_photo(path: str, caption: str) -> None:
+    boundary = uuid.uuid4().hex
+    parts = []
+    for k, v in (("chat_id", TG_CHAT_ID), ("caption", redact(caption)[:1000])):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+        )
+    img_bytes = Path(path).read_bytes()
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"debug.png\"\r\n"
+        f"Content-Type: image/png\r\n\r\n".encode()
+        + img_bytes
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=30):
+        pass
+
+
+async def notify_photo(zp, caption: str) -> None:
+    try:
+        shot = "/tmp/zoom_debug.png"
+        await zp.screenshot(path=shot)
+        await asyncio.to_thread(_bot_photo, shot, caption)
+    except Exception as e:
+        log(f"Telegram screenshot failed ({type(e).__name__})")
 
 
 # --------------------------------------------------------------------------
@@ -515,27 +552,50 @@ async def click_browser_join(zp) -> bool:
     return False
 
 
-async def to_web_client(zp) -> None:
-    if "/wc/" in zp.url:
-        return
+async def _has_webclient(context, zp):
+    for p in context.pages:
+        if "/wc/" in p.url:
+            return p
+        for f in p.frames:
+            if "/wc/" in f.url:
+                return p
+    return None
+
+
+async def to_web_client(context, zp):
+    found = await _has_webclient(context, zp)
+    if found:
+        log(f"Web client active: {mask_url(found.url)}")
+        return found
+
+    clicked_browser = False
     for _ in range(10):
-        if "/wc/" in zp.url:
-            return
-        if await click_browser_join(zp):
+        found = await _has_webclient(context, zp)
+        if found:
+            log(f"Web client active: {mask_url(found.url)}")
+            return found
+        if not clicked_browser and await click_browser_join(zp):
+            clicked_browser = True
             log("Clicked 'Join from browser'")
-            try:
-                await zp.wait_for_url(re.compile(r"/wc/"), timeout=10000)
-                return
-            except Exception:
-                if "/wc/" in zp.url:
-                    return
-                break
+            end = time.monotonic() + 18
+            while time.monotonic() < end:
+                found = await _has_webclient(context, zp)
+                if found:
+                    log(f"Web client loaded: {mask_url(found.url)}")
+                    return found
+                if await in_meeting(zp):
+                    return zp
+                await asyncio.sleep(0.5)
+            break
         await asyncio.sleep(0.5)
 
     if re.search(r"/(j|w)/", zp.url):
         new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
         log("Rewriting Zoom link to the web client")
         await zp.goto(new_url, wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        log(f"After rewrite URL: {mask_url(zp.url)}")
+    return zp
 
 
 async def ensure_muted(zp) -> None:
@@ -578,11 +638,17 @@ async def dismiss_popups(zp) -> None:
 
 
 async def in_meeting(zp) -> bool:
+    try:
+        await zp.mouse.move(960, 1040)
+    except Exception:
+        pass
     for frame in zp.frames:
         try:
             loc = frame.locator(
-                "#wc-footer, #foot-bar, button[aria-label*='Leave' i], "
-                "button:has-text('Leave')"
+                "#wc-footer, #foot-bar, [class*='footer-chat'], "
+                "button[aria-label*='Leave' i], button:has-text('Leave'), "
+                "button[aria-label*='Audio' i], button[aria-label*='Participants' i], "
+                "button[aria-label*='Chat' i], #wc-container-left"
             ).first
             if await loc.count() and await loc.is_visible():
                 return True
@@ -591,9 +657,12 @@ async def in_meeting(zp) -> bool:
     return False
 
 
-async def wait_in_meeting(zp, max_wait: int = 1800) -> None:
+async def wait_in_meeting(zp, max_wait: int = 300) -> None:
     """Wait through the waiting room; start recording only once inside."""
     deadline = time.monotonic() + max_wait
+    started_wait = time.monotonic()
+    last_diag = -60.0
+    sent_debug = False
     while time.monotonic() < deadline:
         text = await page_text(zp)
         if END_RE.search(text):
@@ -602,6 +671,14 @@ async def wait_in_meeting(zp, max_wait: int = 1800) -> None:
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
             log("Inside the meeting")
             return
+        elapsed = time.monotonic() - started_wait
+        if elapsed - last_diag >= 30:
+            last_diag = elapsed
+            snippet = re.sub(r"\s+", " ", text).strip()[:160]
+            log(f"Waiting for meeting UI ({mask_url(zp.url)}): {snippet}")
+        if not sent_debug and elapsed >= 30:
+            sent_debug = True
+            await notify_photo(zp, f"⏳ Waiting to enter Zoom ({mask_url(zp.url)})")
         await asyncio.sleep(2)
     log("Could not confirm meeting UI; starting the recording anyway")
 
@@ -797,7 +874,7 @@ async def main() -> int:
                 await open_todays_classes(page)
                 zoom_page = await wait_and_join(context, page)
 
-                await to_web_client(zoom_page)
+                zoom_page = await to_web_client(context, zoom_page)
                 await zoom_prejoin(zoom_page)
                 await wait_in_meeting(zoom_page)
                 await join_audio(zoom_page)
