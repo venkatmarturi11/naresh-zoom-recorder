@@ -56,7 +56,9 @@ CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
 CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "90"))
 MAX_WAIT_MIN = int(_env("MAX_WAIT_MIN", "45"))  # wait for Join to activate
 MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", str(CLASS_DURATION_MIN * 60)))  # 90 min default
-PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (PORTAL_USER.split("@")[0] or "Student")
+PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (
+    PORTAL_USER.split("@")[0] if "@" in PORTAL_USER else "Student"
+)
 
 RECORD_PATH = _env("RECORD_PATH", "/tmp/class_recording.mp4")
 FFMPEG_LOG = "/tmp/ffmpeg.log"
@@ -66,8 +68,11 @@ SINK = "VirtualSpeaker"
 # Optional selector overrides for the portal login form
 USER_SEL = _env(
     "USER_SELECTOR",
-    'input[type="email"], input[name*="user" i], input[name*="email" i], '
-    'input[id*="user" i], input[id*="email" i], input[type="text"]',
+    'input[placeholder*="Email or Phone" i], input[placeholder*="Phone" i], '
+    'input[type="tel"], input[type="email"], input[name*="phone" i], '
+    'input[name*="mobile" i], input[name*="login" i], input[name*="user" i], '
+    'input[name*="email" i], input[id*="user" i], input[id*="email" i], '
+    'input[type="text"]',
 )
 PASS_SEL = _env("PASS_SELECTOR", 'input[type="password"]')
 
