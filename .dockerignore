@@ -1,0 +1,8 @@
+.git
+.github
+.env
+*.mp4
+out/
+parts/
+__pycache__/
+README.md

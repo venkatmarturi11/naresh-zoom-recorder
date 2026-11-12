@@ -1,0 +1,8 @@
+.env
+*.mp4
+*.jpg
+parts/
+out/
+__pycache__/
+*.pyc
+*.session

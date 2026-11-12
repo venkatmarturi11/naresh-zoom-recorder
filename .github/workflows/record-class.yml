@@ -1,0 +1,58 @@
+name: Record class
+
+on:
+  schedule:
+    # 13:52 UTC = 7:22 PM IST (8 minutes before the 7:30 PM class)
+    - cron: "52 13 * * *"
+  workflow_dispatch:
+    inputs:
+      class_keyword:
+        description: "Class name to look for on the portal"
+        required: false
+        default: ""
+      class_start:
+        description: "Class start time in IST (HH:MM)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: record-class
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Pull pre-built image
+        run: docker pull -q "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
+
+      - name: Record class and upload to Telegram
+        env:
+          PORTAL_URL: ${{ secrets.PORTAL_URL }}
+          PORTAL_USER: ${{ secrets.PORTAL_USER }}
+          PORTAL_PASS: ${{ secrets.PORTAL_PASS }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CLASS_KEYWORD: ${{ inputs.class_keyword || vars.CLASS_KEYWORD || 'React JS' }}
+          CLASS_START: ${{ inputs.class_start || vars.CLASS_START || '19:30' }}
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm --init --shm-size=2g \
+            -v "$PWD/out:/out" \
+            -e RECORD_PATH=/out/class_recording.mp4 \
+            -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
+            -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
+            -e CLASS_KEYWORD -e CLASS_START \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
