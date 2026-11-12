@@ -339,6 +339,7 @@ async def login(page) -> None:
             await pw_field.press("Enter")
 
     await page.wait_for_load_state("domcontentloaded")
+    await asyncio.sleep(1.0)
     try:
         await page.locator(PASS_SEL).first.wait_for(state="hidden", timeout=20000)
     except PWTimeout:
@@ -356,6 +357,7 @@ async def open_todays_classes(page) -> None:
     except Exception:
         pass  # may already be the default tab
     await page.wait_for_load_state("domcontentloaded")
+    await asyncio.sleep(1.0)
 
 
 def card_locator(page):
@@ -383,9 +385,10 @@ async def join_ready(btn) -> bool:
             return False
         info = await btn.evaluate(
             "e=>({d:e.hasAttribute('disabled'),a:e.getAttribute('aria-disabled'),"
-            "c:String(e.className||''),p:getComputedStyle(e).pointerEvents})"
+            "c:String(e.className||''),p:getComputedStyle(e).pointerEvents,"
+            "cur:getComputedStyle(e).cursor})"
         )
-        if info["d"] or info["a"] == "true" or info["p"] == "none":
+        if info["d"] or info["a"] == "true" or info["p"] == "none" or info["cur"] == "not-allowed":
             return False
         if re.search(r"\bdisabled\b|btn-secondary|inactive", info["c"].lower()):
             return False
