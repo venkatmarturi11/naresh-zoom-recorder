@@ -502,12 +502,38 @@ async def click_join(context, page, btn, wait_sec: int = 25):
 # --------------------------------------------------------------------------
 # State 4: Zoom web client, strictly no mic / no video
 # --------------------------------------------------------------------------
+async def click_browser_join(zp) -> bool:
+    pat = re.compile(r"join from (your )?browser", re.I)
+    for frame in zp.frames:
+        try:
+            loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=3000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def to_web_client(zp) -> None:
-    url = zp.url
-    if "/wc/" in url:
+    if "/wc/" in zp.url:
         return
-    if "/j/" in url:
-        new_url = url.replace("/j/", "/wc/join/", 1)
+    for _ in range(10):
+        if "/wc/" in zp.url:
+            return
+        if await click_browser_join(zp):
+            log("Clicked 'Join from browser'")
+            try:
+                await zp.wait_for_url(re.compile(r"/wc/"), timeout=10000)
+                return
+            except Exception:
+                if "/wc/" in zp.url:
+                    return
+                break
+        await asyncio.sleep(0.5)
+
+    if re.search(r"/(j|w)/", zp.url):
+        new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
         log("Rewriting Zoom link to the web client")
         await zp.goto(new_url, wait_until="domcontentloaded")
 
@@ -521,6 +547,10 @@ async def zoom_prejoin(zp) -> None:
     deadline = time.monotonic() + 60
     clicked_join = False
     while time.monotonic() < deadline:
+        if await in_meeting(zp):
+            clicked_join = True
+            break
+        await click_browser_join(zp)
         await click_any(zp, [r"^accept cookies", r"^accept all", r"^i agree$"])
         await click_any(zp, [r"continue without (audio|microphone)"])
         await ensure_muted(zp)
