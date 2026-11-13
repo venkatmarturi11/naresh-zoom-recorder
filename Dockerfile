@@ -20,6 +20,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Pre-approve external protocol handlers (zoommtg, zoomus, zoom) in Chromium policies
+# and replace xdg-open with a no-op so the "Open xdg-open?" browser prompt never appears.
+RUN mkdir -p /etc/chromium/policies/managed /etc/opt/chrome/policies/managed /etc/chromium-browser/policies/managed \
+    && echo '{"AutoLaunchProtocolsFromOrigins":[{"protocol":"zoommtg","allowed_origins":["*"]},{"protocol":"zoomus","allowed_origins":["*"]},{"protocol":"zoom","allowed_origins":["*"]}]}' > /etc/chromium/policies/managed/protocols.json \
+    && cp /etc/chromium/policies/managed/protocols.json /etc/opt/chrome/policies/managed/protocols.json \
+    && cp /etc/chromium/policies/managed/protocols.json /etc/chromium-browser/policies/managed/protocols.json \
+    && echo '#!/bin/sh\nexit 0' > /usr/local/bin/xdg-open \
+    && chmod +x /usr/local/bin/xdg-open \
+    && cp /usr/local/bin/xdg-open /usr/bin/xdg-open
+
 WORKDIR /app
 
 COPY requirements.txt .

@@ -103,7 +103,9 @@ HIDE_CSS = """
 * { cursor: none !important; }
 #wc-footer, #foot-bar, .footer-bar, .footer__inner, .meeting-info-container,
 .zm-notification, [class*='toast'], [class*='Toast'], [class*='notification'],
-[class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'] {
+[class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'],
+.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*='backdrop'],
+.recording-disclaimer, [class*='record-disclaimer'], [class*='recording-tip'] {
   display: none !important; visibility: hidden !important; opacity: 0 !important;
 }
 """
@@ -602,6 +604,10 @@ async def to_web_client(context, zp):
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
         log(f"After rewrite URL: {mask_url(zp.url)}")
+        try:
+            sh(["xdotool", "key", "Escape"])
+        except Exception:
+            pass
     return zp
 
 
@@ -701,10 +707,13 @@ async def zoom_prejoin(zp) -> None:
 
 
 POPUP_PATTERNS = [
-    r"^got it$",
     r"^ok$",
+    r"^got it$",
     r"^i agree$",
-    r"^i understand$",
+    r"^agree$",
+    r"^stay in meeting$",
+    r"^stay muted$",
+    r"^continue$",
     r"^accept( all)?( cookies)?$",
     r"^allow( all)?( cookies)?$",
     r"^dismiss$",
@@ -713,25 +722,92 @@ POPUP_PATTERNS = [
     r"^maybe later$",
     r"^no,? thanks$",
     r"^continue without (audio|microphone)$",
-    r"^continue$",
 ]
 
 
 async def dismiss_popups(zp) -> None:
-    await click_any(zp, POPUP_PATTERNS)
+    """Dismiss any consent, disclaimer, recording, or audio modals in Zoom or the browser."""
+    # 1. Playwright locators for OK / consent buttons on modals
+    for frame in zp.frames:
+        for selector in [
+            ".zm-modal button:has-text('OK')",
+            "[role='dialog'] button:has-text('OK')",
+            "button.zm-btn--primary:has-text('OK')",
+            "button:has-text('OK')",
+            "button:has-text('Got it')",
+            "button:has-text('I Agree')",
+            "button:has-text('Stay in Meeting')",
+            "button:has-text('Agree')",
+            "button:has-text('Continue')",
+            "button:has-text('Stay muted')",
+            "[role='dialog'] button[aria-label*='close' i]",
+            ".zm-modal button[aria-label*='close' i]",
+            "button[aria-label='Close' i]",
+        ]:
+            try:
+                btn = frame.locator(selector).first
+                if await btn.count() and await btn.is_visible():
+                    label = (await btn.inner_text() or await btn.get_attribute("aria-label") or "").strip()
+                    if not re.search(r"\b(leave|end|exit)\b", label, re.I):
+                        await btn.click(force=True, timeout=1000)
+                        log(f"Dismissed popup via {selector} (text='{label}')")
+            except Exception:
+                continue
+
+    # 2. Comprehensive JavaScript DOM evaluation across all frames
+    js_dismiss = """
+    () => {
+        let dismissed = 0;
+        // A. Look for any dialog / modal with recording / consent / notice text
+        const dialogs = document.querySelectorAll(
+            '[role="dialog"], .zm-modal, .modal-dialog, [class*="modal"], [class*="disclaimer"], [class*="dialog"]'
+        );
+        for (const dlg of dialogs) {
+            const text = (dlg.innerText || '').toLowerCase();
+            if (
+                text.includes('recording') ||
+                text.includes('recorded') ||
+                text.includes('transcript') ||
+                text.includes('terms of service') ||
+                text.includes('camera') ||
+                text.includes('microphone') ||
+                text.includes('cookie')
+            ) {
+                const btns = dlg.querySelectorAll('button, [role="button"], a.zm-btn, .zm-btn');
+                for (const b of btns) {
+                    const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    if (/^(ok|got it|i agree|agree|stay in meeting|continue|close)$/i.test(bText)) {
+                        try { b.click(); dismissed++; } catch(e) {}
+                    }
+                }
+                try { dlg.remove(); dismissed++; } catch(e) {}
+            }
+        }
+
+        // B. Remove backdrops / overlay blockers
+        document.querySelectorAll(
+            '.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*="backdrop"], [class*="overlay-shade"]'
+        ).forEach(el => {
+            try { el.remove(); dismissed++; } catch(e) {}
+        });
+
+        // C. Universal click on any visible OK or Got it button
+        for (const b of document.querySelectorAll('button, [role="button"], .zm-btn')) {
+            const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
+            if (bText === 'ok' || bText === 'got it') {
+                try { b.click(); dismissed++; } catch(e) {}
+            }
+        }
+        return dismissed;
+    }
+    """
     for frame in zp.frames:
         try:
-            close_btn = frame.locator(
-                "[role='dialog'] button[aria-label*='close' i], "
-                ".zm-modal button[aria-label*='close' i], "
-                "button[aria-label='Close' i]"
-            ).first
-            if await close_btn.count() and await close_btn.is_visible():
-                label = (await close_btn.get_attribute("aria-label") or "").lower()
-                if not re.search(r"leave|end|exit", label):
-                    await close_btn.click(timeout=800)
+            d_count = await frame.evaluate(js_dismiss)
+            if d_count:
+                log(f"Cleared {d_count} popup element(s)")
         except Exception:
-            continue
+            pass
 
 
 async def in_meeting(zp) -> bool:
@@ -766,6 +842,7 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
             raise RuntimeError("Meeting ended before the recording could start")
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
+            await dismiss_popups(zp)
             log("Inside the meeting")
             return
         elapsed = time.monotonic() - started_wait
@@ -845,11 +922,11 @@ async def monitor(zp, started: float) -> str:
             if failures > 20:
                 return "page became unreachable"
 
-        if time.monotonic() - last_housekeeping > 10:
+        if time.monotonic() - last_housekeeping > 3:
             last_housekeeping = time.monotonic()
             await dismiss_popups(zp)
             await inject_hide_css(zp)
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 
 # --------------------------------------------------------------------------
@@ -967,7 +1044,12 @@ async def main() -> int:
         (prof_dir / "Default").mkdir(parents=True, exist_ok=True)
         (prof_dir / "Default" / "Preferences").write_text(json.dumps({
             "protocol_handler": {
-                "excluded_schemes": {"zoommtg": True, "zoomus": True, "zoom": True}
+                "allowed_origin_protocol_pairs": {
+                    "https://us06web.zoom.us": {"zoommtg": True, "zoomus": True, "zoom": True},
+                    "https://app.zoom.us": {"zoommtg": True, "zoomus": True, "zoom": True},
+                    "https://zoom.us": {"zoommtg": True, "zoomus": True, "zoom": True}
+                },
+                "excluded_schemes": {"zoommtg": False, "zoomus": False, "zoom": False}
             }
         }))
 
@@ -986,6 +1068,12 @@ async def main() -> int:
                 "window.chrome = window.chrome || { runtime: {} };"
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
+                "document.addEventListener('click', (e) => {"
+                "  const a = e.target && e.target.closest ? e.target.closest('a') : null;"
+                "  if (a && a.href && /^zoom(mtg|us)?:/i.test(a.href)) {"
+                "    e.preventDefault(); e.stopPropagation();"
+                "  }"
+                "}, true);"
             )
             await context.route(
                 re.compile(r"^zoom(mtg|us)?://", re.I),
@@ -1013,12 +1101,15 @@ async def main() -> int:
                 await wait_in_meeting(zoom_page)
                 await join_audio(zoom_page)
 
+                await dismiss_popups(zoom_page)
+                await go_fullscreen(zoom_page)
+                await dismiss_popups(zoom_page)
+
                 recorder.start()
                 started = time.monotonic()
                 log("Recording started")
                 await notify("✅ Joined class & started 1080p recording")
 
-                await go_fullscreen(zoom_page)
                 end_reason = await monitor(zoom_page, started)
                 log(f"Recording ends: {end_reason}")
             except asyncio.CancelledError:
