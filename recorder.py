@@ -550,6 +550,7 @@ async def click_browser_join(zp) -> bool:
         try:
             loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
             if await loc.count() and await loc.is_visible():
+                await loc.scroll_into_view_if_needed()
                 await loc.click(timeout=3000)
                 return True
         except Exception:
@@ -574,7 +575,7 @@ async def to_web_client(context, zp):
         return found
 
     clicked_browser = False
-    for _ in range(10):
+    for _ in range(30):
         found = await _has_webclient(context, zp)
         if found:
             log(f"Web client active: {mask_url(found.url)}")
@@ -582,7 +583,7 @@ async def to_web_client(context, zp):
         if not clicked_browser and await click_browser_join(zp):
             clicked_browser = True
             log("Clicked 'Join from browser'")
-            end = time.monotonic() + 18
+            end = time.monotonic() + 20
             while time.monotonic() < end:
                 found = await _has_webclient(context, zp)
                 if found:
@@ -935,6 +936,10 @@ async def main() -> int:
             await context.add_init_script(
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
+            )
+            await context.route(
+                re.compile(r"^zoom(mtg|us)?://", re.I),
+                lambda r: r.abort(),
             )
             async def _dismiss_dialog(d):
                 try:
