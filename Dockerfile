@@ -7,17 +7,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Virtual display, virtual audio, encoder, cursor hiding, build tools for tgcrypto
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        xvfb \
-        pulseaudio \
-        pulseaudio-utils \
-        ffmpeg \
-        xdotool \
-        unclutter \
-        x11-utils \
-        ca-certificates \
-        gcc \
-        libc6-dev \
-        python3-dev \
+    xvfb \
+    pulseaudio \
+    pulseaudio-utils \
+    ffmpeg \
+    xdotool \
+    unclutter \
+    x11-utils \
+    ca-certificates \
+    gcc \
+    libc6-dev \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

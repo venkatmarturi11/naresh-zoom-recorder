@@ -111,6 +111,7 @@ HIDE_CSS = """
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
     "--window-size=1920,1080",
     "--window-position=0,0",
     "--kiosk",
@@ -621,7 +622,16 @@ async def click_prejoin_join(zp) -> bool:
             try:
                 btn = frame.locator(sel).first
                 if await btn.count() and await btn.is_visible():
-                    await btn.click(timeout=1500)
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click(force=True, timeout=1500)
+                    try:
+                        await btn.evaluate("b => { b.click(); if (b.form) b.form.submit(); }")
+                    except Exception:
+                        pass
+                    try:
+                        await btn.press("Enter")
+                    except Exception:
+                        pass
                     log(f"Clicked pre-join button ({sel})")
                     return True
             except Exception:
@@ -636,7 +646,12 @@ async def click_prejoin_join(zp) -> bool:
                 if re.fullmatch(r"join|join meeting", txt, re.I):
                     box = await b.bounding_box()
                     if box and box["y"] > 250:
-                        await b.click(timeout=1500)
+                        await b.scroll_into_view_if_needed()
+                        await b.click(force=True, timeout=1500)
+                        try:
+                            await b.evaluate("b => b.click()")
+                        except Exception:
+                            pass
                         log(f"Clicked pre-join button at y={box['y']:.0f}")
                         return True
         except Exception:
@@ -657,10 +672,17 @@ async def zoom_prejoin(zp) -> None:
 
         for frame in zp.frames:
             try:
-                name_in = frame.locator("#input-for-name, input[placeholder*='name' i]").first
+                name_in = frame.locator(
+                    "input#inputname, input[name='inputname'], input#display_name, "
+                    "input[name='display_name'], input#input-for-name, "
+                    "input[placeholder*='name' i], input[type='text']:visible"
+                ).first
                 if await name_in.count() and await name_in.is_visible():
-                    if not (await name_in.input_value()).strip():
+                    val = await name_in.input_value()
+                    if not val.strip():
                         await name_in.fill(PARTICIPANT_NAME)
+                        log(f"Filled participant name: {PARTICIPANT_NAME}")
+                        await name_in.press("Enter")
             except Exception:
                 continue
 
@@ -960,6 +982,8 @@ async def main() -> int:
                 no_viewport=True,
             )
             await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+                "window.chrome = window.chrome || { runtime: {} };"
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
             )
