@@ -604,10 +604,6 @@ async def to_web_client(context, zp):
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
         log(f"After rewrite URL: {mask_url(zp.url)}")
-        try:
-            sh(["xdotool", "key", "Escape"])
-        except Exception:
-            pass
     return zp
 
 
@@ -727,56 +723,42 @@ POPUP_PATTERNS = [
 
 async def dismiss_popups(zp) -> None:
     """Dismiss any consent, disclaimer, recording, or audio modals in Zoom or the browser."""
-    # 1. Playwright locators for OK / consent buttons on modals
-    for frame in zp.frames:
-        for selector in [
-            ".zm-modal button:has-text('OK')",
-            "[role='dialog'] button:has-text('OK')",
-            "button.zm-btn--primary:has-text('OK')",
-            "button:has-text('OK')",
-            "button:has-text('Got it')",
-            "button:has-text('I Agree')",
-            "button:has-text('Stay in Meeting')",
-            "button:has-text('Agree')",
-            "button:has-text('Continue')",
-            "button:has-text('Stay muted')",
-            "[role='dialog'] button[aria-label*='close' i]",
-            ".zm-modal button[aria-label*='close' i]",
-            "button[aria-label='Close' i]",
-        ]:
-            try:
-                btn = frame.locator(selector).first
-                if await btn.count() and await btn.is_visible():
-                    label = (await btn.inner_text() or await btn.get_attribute("aria-label") or "").strip()
-                    if not re.search(r"\b(leave|end|exit)\b", label, re.I):
-                        await btn.click(force=True, timeout=1000)
-                        log(f"Dismissed popup via {selector} (text='{label}')")
-            except Exception:
-                continue
+    # 1. Standard button clicker for known popup patterns
+    await click_any(zp, POPUP_PATTERNS)
 
-    # 2. Comprehensive JavaScript DOM evaluation across all frames
+    # 2. Targeted locator clicks for close buttons
+    for frame in zp.frames:
+        try:
+            close_btn = frame.locator(
+                "[role='dialog'] button[aria-label*='close' i], "
+                ".zm-modal button[aria-label*='close' i], "
+                "button[aria-label='Close' i]"
+            ).first
+            if await close_btn.count() and await close_btn.is_visible():
+                label = (await close_btn.get_attribute("aria-label") or "").lower()
+                if not re.search(r"\b(leave|end|exit)\b", label):
+                    await close_btn.click(timeout=800)
+        except Exception:
+            continue
+
+    # 3. Dedicated in-meeting cleaner for recording consent dialogs
     js_dismiss = """
     () => {
+        // Safety guard: NEVER remove anything if we are still on the pre-join screen!
+        if (document.querySelector('button.preview-join-button, input#inputname, input[name="inputname"]')) {
+            return 0;
+        }
+
         let dismissed = 0;
-        // A. Look for any dialog / modal with recording / consent / notice text
-        const dialogs = document.querySelectorAll(
-            '[role="dialog"], .zm-modal, .modal-dialog, [class*="modal"], [class*="disclaimer"], [class*="dialog"]'
-        );
+        // Specifically find the "This meeting is being recorded" disclaimer
+        const dialogs = document.querySelectorAll('[role="dialog"], .zm-modal, .modal-dialog, div');
         for (const dlg of dialogs) {
             const text = (dlg.innerText || '').toLowerCase();
-            if (
-                text.includes('recording') ||
-                text.includes('recorded') ||
-                text.includes('transcript') ||
-                text.includes('terms of service') ||
-                text.includes('camera') ||
-                text.includes('microphone') ||
-                text.includes('cookie')
-            ) {
+            if (text.includes('meeting is being recorded') || text.includes('recording or transcript')) {
                 const btns = dlg.querySelectorAll('button, [role="button"], a.zm-btn, .zm-btn');
                 for (const b of btns) {
                     const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    if (/^(ok|got it|i agree|agree|stay in meeting|continue|close)$/i.test(bText)) {
+                    if (/^(ok|got it|i agree|agree|stay in meeting|continue)$/i.test(bText)) {
                         try { b.click(); dismissed++; } catch(e) {}
                     }
                 }
@@ -784,20 +766,11 @@ async def dismiss_popups(zp) -> None:
             }
         }
 
-        // B. Remove backdrops / overlay blockers
-        document.querySelectorAll(
-            '.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*="backdrop"], [class*="overlay-shade"]'
-        ).forEach(el => {
+        // Remove modal backdrop overlay so the screen share is completely unobscured
+        document.querySelectorAll('.zm-modal-backdrop, .modal-backdrop').forEach(el => {
             try { el.remove(); dismissed++; } catch(e) {}
         });
 
-        // C. Universal click on any visible OK or Got it button
-        for (const b of document.querySelectorAll('button, [role="button"], .zm-btn')) {
-            const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
-            if (bText === 'ok' || bText === 'got it') {
-                try { b.click(); dismissed++; } catch(e) {}
-            }
-        }
         return dismissed;
     }
     """
