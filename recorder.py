@@ -609,6 +609,41 @@ async def ensure_muted(zp) -> None:
     await click_any(zp, [r"^mute\b", r"^stop video"])
 
 
+async def click_prejoin_join(zp) -> bool:
+    for frame in zp.frames:
+        for sel in [
+            "button.preview-join-button",
+            "button[class*='preview-join']",
+            "button[class*='join-btn']",
+            "button.zm-btn--primary",
+            "[class*='preview'] button[type='button']",
+        ]:
+            try:
+                btn = frame.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(timeout=1500)
+                    log(f"Clicked pre-join button ({sel})")
+                    return True
+            except Exception:
+                continue
+
+        try:
+            btns = frame.locator("button, [role='button']")
+            count = await btns.count()
+            for i in range(count):
+                b = btns.nth(i)
+                txt = (await b.inner_text() or "").strip()
+                if re.fullmatch(r"join|join meeting", txt, re.I):
+                    box = await b.bounding_box()
+                    if box and box["y"] > 250:
+                        await b.click(timeout=1500)
+                        log(f"Clicked pre-join button at y={box['y']:.0f}")
+                        return True
+        except Exception:
+            continue
+    return False
+
+
 async def zoom_prejoin(zp) -> None:
     deadline = time.monotonic() + 60
     clicked_join = False
@@ -629,23 +664,14 @@ async def zoom_prejoin(zp) -> None:
             except Exception:
                 continue
 
-        matched = await click_any(zp, [r"^join$", r"^join meeting$"])
-        if matched:
-            log(f"Clicked pre-join button ({matched})")
+        if await click_prejoin_join(zp):
             clicked_join = True
-            break
-        for frame in zp.frames:
-            try:
-                jb = frame.locator("button.preview-join-button").first
-                if await jb.count() and await jb.is_visible() and await jb.is_enabled():
-                    await jb.click(timeout=1500)
-                    log("Clicked preview-join-button")
-                    clicked_join = True
-                    break
-            except Exception:
-                continue
-        if clicked_join:
-            break
+            await asyncio.sleep(2)
+            if await in_meeting(zp):
+                break
+            text = await page_text(zp)
+            if not re.search(r"cannot detect your camera|terms of service", text, re.I):
+                break
         await asyncio.sleep(1)
 
     if not clicked_join:
@@ -728,9 +754,9 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if not sent_debug and elapsed >= 30:
             sent_debug = True
             await notify_photo(zp, f"⏳ Waiting to enter Zoom ({mask_url(zp.url)})")
-        # If still stuck on the pre-join screen, retry clicking Join periodically
-        if elapsed >= 8 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 10 < 2:
-            await click_any(zp, [r"^join$", r"^join meeting$"])
+        # If still stuck on the pre-join screen, retry clicking the real pre-join button
+        if elapsed >= 4 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 5 < 2:
+            await click_prejoin_join(zp)
         await asyncio.sleep(2)
     log("Could not confirm meeting UI; starting the recording anyway")
 
