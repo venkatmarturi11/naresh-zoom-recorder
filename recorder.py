@@ -104,8 +104,7 @@ HIDE_CSS = """
 #wc-footer, #foot-bar, .footer-bar, .footer__inner, .meeting-info-container,
 .zm-notification, [class*='toast'], [class*='Toast'], [class*='notification'],
 [class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'],
-.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*='backdrop'],
-.recording-disclaimer, [class*='record-disclaimer'], [class*='recording-tip'] {
+.zm-modal-backdrop, .modal-backdrop {
   display: none !important; visibility: hidden !important; opacity: 0 !important;
 }
 """
@@ -561,36 +560,34 @@ async def click_browser_join(zp) -> bool:
     return False
 
 
-async def _has_webclient(context, zp, meeting_id: str = ""):
+async def _has_webclient(context, zp):
     for p in context.pages:
-        u = p.url.rstrip("/")
-        if "/wc/" in u and u.endswith("/join"):
-            if not meeting_id or meeting_id in u:
+        if "/wc/" in p.url:
+            return p
+        for f in p.frames:
+            if "/wc/" in f.url:
                 return p
     return None
 
 
 async def to_web_client(context, zp):
-    m = re.search(r"/(?:j|w|wc)/(\d+)", zp.url) or re.search(r"(\d{9,11})", zp.url)
-    mid = m.group(1) if m else ""
-
-    found = await _has_webclient(context, zp, mid)
+    found = await _has_webclient(context, zp)
     if found:
         log(f"Web client active: {mask_url(found.url)}")
         return found
 
     clicked_browser = False
-    for _ in range(20):
-        found = await _has_webclient(context, zp, mid)
+    for _ in range(30):
+        found = await _has_webclient(context, zp)
         if found:
             log(f"Web client active: {mask_url(found.url)}")
             return found
         if not clicked_browser and await click_browser_join(zp):
             clicked_browser = True
             log("Clicked 'Join from browser'")
-            end = time.monotonic() + 15
+            end = time.monotonic() + 20
             while time.monotonic() < end:
-                found = await _has_webclient(context, zp, mid)
+                found = await _has_webclient(context, zp)
                 if found:
                     log(f"Web client loaded: {mask_url(found.url)}")
                     return found
@@ -600,17 +597,8 @@ async def to_web_client(context, zp):
             break
         await asyncio.sleep(0.5)
 
-    if mid:
-        target_url = f"https://app.zoom.us/wc/{mid}/join"
-        query = urllib.parse.urlparse(zp.url).query
-        if query:
-            target_url += f"?{query}"
-        log(f"Navigating to canonical Zoom web client URL: {mask_url(target_url)}")
-        await zp.goto(target_url, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        log(f"After rewrite URL: {mask_url(zp.url)}")
-    elif re.search(r"/(j|w)/", zp.url):
-        new_url = re.sub(r"/(j|w)/(\d+)", r"/wc/\2/join", zp.url, count=1)
+    if re.search(r"/(j|w)/", zp.url):
+        new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
         log("Rewriting Zoom link to the web client")
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
@@ -624,9 +612,6 @@ async def ensure_muted(zp) -> None:
 
 
 async def click_prejoin_join(zp) -> bool:
-    if re.search(r"app\.zoom\.us/wc/?$", zp.url):
-        return False
-
     for frame in zp.frames:
         for sel in [
             "button.preview-join-button",
@@ -659,7 +644,7 @@ async def click_prejoin_join(zp) -> bool:
             for i in range(count):
                 b = btns.nth(i)
                 txt = (await b.inner_text() or "").strip()
-                if re.fullmatch(r"^join$", txt, re.I):
+                if re.fullmatch(r"join|join meeting", txt, re.I):
                     box = await b.bounding_box()
                     if box and box["y"] > 250:
                         await b.scroll_into_view_if_needed()
@@ -675,21 +660,13 @@ async def click_prejoin_join(zp) -> bool:
     return False
 
 
-async def zoom_prejoin(zp, meeting_id: str = "") -> None:
-    target_url = f"https://app.zoom.us/wc/{meeting_id}/join" if meeting_id else ""
+async def zoom_prejoin(zp) -> None:
     deadline = time.monotonic() + 60
     clicked_join = False
     while time.monotonic() < deadline:
         if await in_meeting(zp):
             clicked_join = True
             break
-
-        if target_url and re.search(r"app\.zoom\.us/wc/?$", zp.url):
-            log(f"Recovering to canonical web client: {mask_url(target_url)}")
-            await zp.goto(target_url, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            continue
-
         await click_browser_join(zp)
         await dismiss_popups(zp)
         await ensure_muted(zp)
@@ -725,13 +702,10 @@ async def zoom_prejoin(zp, meeting_id: str = "") -> None:
 
 
 POPUP_PATTERNS = [
-    r"^ok$",
     r"^got it$",
+    r"^ok$",
     r"^i agree$",
-    r"^agree$",
-    r"^stay in meeting$",
-    r"^stay muted$",
-    r"^continue$",
+    r"^i understand$",
     r"^accept( all)?( cookies)?$",
     r"^allow( all)?( cookies)?$",
     r"^dismiss$",
@@ -740,16 +714,19 @@ POPUP_PATTERNS = [
     r"^maybe later$",
     r"^no,? thanks$",
     r"^continue without (audio|microphone)$",
+    r"^continue$",
 ]
 
 
 async def dismiss_popups(zp) -> None:
-    """Dismiss any consent, disclaimer, recording, or audio modals in Zoom or the browser."""
-    # 1. Standard button clicker for known popup patterns
     await click_any(zp, POPUP_PATTERNS)
-
-    # 2. Targeted locator clicks for close buttons
     for frame in zp.frames:
+        try:
+            ok_btn = frame.locator(".zm-modal button:has-text('OK'), [role='dialog'] button:has-text('OK'), button:has-text('OK')").first
+            if await ok_btn.count() and await ok_btn.is_visible():
+                await ok_btn.click(timeout=800)
+        except Exception:
+            pass
         try:
             close_btn = frame.locator(
                 "[role='dialog'] button[aria-label*='close' i], "
@@ -758,51 +735,25 @@ async def dismiss_popups(zp) -> None:
             ).first
             if await close_btn.count() and await close_btn.is_visible():
                 label = (await close_btn.get_attribute("aria-label") or "").lower()
-                if not re.search(r"\b(leave|end|exit)\b", label):
+                if not re.search(r"leave|end|exit", label):
                     await close_btn.click(timeout=800)
         except Exception:
             continue
-
-    # 3. Dedicated in-meeting cleaner for recording consent dialogs
-    js_dismiss = """
-    () => {
-        // Safety guard: NEVER remove anything if we are still on the pre-join screen!
-        if (document.querySelector('button.preview-join-button, input#inputname, input[name="inputname"]')) {
-            return 0;
-        }
-
-        let dismissed = 0;
-        // Specifically find the "This meeting is being recorded" disclaimer
-        const dialogs = document.querySelectorAll('[role="dialog"], .zm-modal, .modal-dialog, div');
-        for (const dlg of dialogs) {
-            const text = (dlg.innerText || '').toLowerCase();
-            if (text.includes('meeting is being recorded') || text.includes('recording or transcript')) {
-                const btns = dlg.querySelectorAll('button, [role="button"], a.zm-btn, .zm-btn');
-                for (const b of btns) {
-                    const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    if (/^(ok|got it|i agree|agree|stay in meeting|continue)$/i.test(bText)) {
-                        try { b.click(); dismissed++; } catch(e) {}
-                    }
+    try:
+        await zp.evaluate("""() => {
+            document.querySelectorAll('[role="dialog"], .zm-modal, div').forEach(el => {
+                if ((el.innerText || '').toLowerCase().includes('meeting is being recorded')) {
+                    const b = el.querySelector('button');
+                    if (b) try { b.click(); } catch(e) {}
+                    try { el.remove(); } catch(e) {}
                 }
-                try { dlg.remove(); dismissed++; } catch(e) {}
-            }
-        }
-
-        // Remove modal backdrop overlay so the screen share is completely unobscured
-        document.querySelectorAll('.zm-modal-backdrop, .modal-backdrop').forEach(el => {
-            try { el.remove(); dismissed++; } catch(e) {}
-        });
-
-        return dismissed;
-    }
-    """
-    for frame in zp.frames:
-        try:
-            d_count = await frame.evaluate(js_dismiss)
-            if d_count:
-                log(f"Cleared {d_count} popup element(s)")
-        except Exception:
-            pass
+            });
+            document.querySelectorAll('.zm-modal-backdrop, .modal-backdrop').forEach(el => {
+                try { el.remove(); } catch(e) {}
+            });
+        }""")
+    except Exception:
+        pass
 
 
 async def in_meeting(zp) -> bool:
@@ -825,9 +776,8 @@ async def in_meeting(zp) -> bool:
     return False
 
 
-async def wait_in_meeting(zp, meeting_id: str = "", max_wait: int = 300) -> None:
+async def wait_in_meeting(zp, max_wait: int = 300) -> None:
     """Wait through the waiting room; start recording only once inside."""
-    target_url = f"https://app.zoom.us/wc/{meeting_id}/join" if meeting_id else ""
     deadline = time.monotonic() + max_wait
     started_wait = time.monotonic()
     last_diag = -60.0
@@ -836,16 +786,8 @@ async def wait_in_meeting(zp, meeting_id: str = "", max_wait: int = 300) -> None
         text = await page_text(zp)
         if END_RE.search(text):
             raise RuntimeError("Meeting ended before the recording could start")
-
-        if target_url and re.search(r"app\.zoom\.us/wc/?$", zp.url):
-            log(f"Recovering to canonical web client: {mask_url(target_url)}")
-            await zp.goto(target_url, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            continue
-
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
-            await dismiss_popups(zp)
             log("Inside the meeting")
             return
         elapsed = time.monotonic() - started_wait
@@ -929,7 +871,7 @@ async def monitor(zp, started: float) -> str:
             last_housekeeping = time.monotonic()
             await dismiss_popups(zp)
             await inject_hide_css(zp)
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
 
 # --------------------------------------------------------------------------
@@ -1047,12 +989,7 @@ async def main() -> int:
         (prof_dir / "Default").mkdir(parents=True, exist_ok=True)
         (prof_dir / "Default" / "Preferences").write_text(json.dumps({
             "protocol_handler": {
-                "allowed_origin_protocol_pairs": {
-                    "https://us06web.zoom.us": {"zoommtg": True, "zoomus": True, "zoom": True},
-                    "https://app.zoom.us": {"zoommtg": True, "zoomus": True, "zoom": True},
-                    "https://zoom.us": {"zoommtg": True, "zoomus": True, "zoom": True}
-                },
-                "excluded_schemes": {"zoommtg": False, "zoomus": False, "zoom": False}
+                "excluded_schemes": {"zoommtg": True, "zoomus": True, "zoom": True}
             }
         }))
 
@@ -1071,12 +1008,6 @@ async def main() -> int:
                 "window.chrome = window.chrome || { runtime: {} };"
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
-                "document.addEventListener('click', (e) => {"
-                "  const a = e.target && e.target.closest ? e.target.closest('a') : null;"
-                "  if (a && a.href && /^zoom(mtg|us)?:/i.test(a.href)) {"
-                "    e.preventDefault(); e.stopPropagation();"
-                "  }"
-                "}, true);"
             )
             await context.route(
                 re.compile(r"^zoom(mtg|us)?://", re.I),
@@ -1099,16 +1030,10 @@ async def main() -> int:
                 await open_todays_classes(page)
                 zoom_page = await wait_and_join(context, page)
 
-                m = re.search(r"/(?:j|w|wc)/(\d+)", zoom_page.url) or re.search(r"(\d{9,11})", zoom_page.url)
-                mid = m.group(1) if m else ""
-
                 zoom_page = await to_web_client(context, zoom_page)
-                await zoom_prejoin(zoom_page, meeting_id=mid)
-                await wait_in_meeting(zoom_page, meeting_id=mid)
+                await zoom_prejoin(zoom_page)
+                await wait_in_meeting(zoom_page)
                 await join_audio(zoom_page)
-
-                await dismiss_popups(zoom_page)
-                await go_fullscreen(zoom_page)
                 await dismiss_popups(zoom_page)
 
                 recorder.start()
@@ -1116,6 +1041,7 @@ async def main() -> int:
                 log("Recording started")
                 await notify("✅ Joined class & started 1080p recording")
 
+                await go_fullscreen(zoom_page)
                 end_reason = await monitor(zoom_page, started)
                 log(f"Recording ends: {end_reason}")
             except asyncio.CancelledError:
