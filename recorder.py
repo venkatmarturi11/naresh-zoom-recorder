@@ -561,34 +561,36 @@ async def click_browser_join(zp) -> bool:
     return False
 
 
-async def _has_webclient(context, zp):
+async def _has_webclient(context, zp, meeting_id: str = ""):
     for p in context.pages:
-        if "/wc/" in p.url:
-            return p
-        for f in p.frames:
-            if "/wc/" in f.url:
+        u = p.url.rstrip("/")
+        if "/wc/" in u and u.endswith("/join"):
+            if not meeting_id or meeting_id in u:
                 return p
     return None
 
 
 async def to_web_client(context, zp):
-    found = await _has_webclient(context, zp)
+    m = re.search(r"/(?:j|w|wc)/(\d+)", zp.url) or re.search(r"(\d{9,11})", zp.url)
+    mid = m.group(1) if m else ""
+
+    found = await _has_webclient(context, zp, mid)
     if found:
         log(f"Web client active: {mask_url(found.url)}")
         return found
 
     clicked_browser = False
-    for _ in range(30):
-        found = await _has_webclient(context, zp)
+    for _ in range(20):
+        found = await _has_webclient(context, zp, mid)
         if found:
             log(f"Web client active: {mask_url(found.url)}")
             return found
         if not clicked_browser and await click_browser_join(zp):
             clicked_browser = True
             log("Clicked 'Join from browser'")
-            end = time.monotonic() + 20
+            end = time.monotonic() + 15
             while time.monotonic() < end:
-                found = await _has_webclient(context, zp)
+                found = await _has_webclient(context, zp, mid)
                 if found:
                     log(f"Web client loaded: {mask_url(found.url)}")
                     return found
@@ -598,8 +600,17 @@ async def to_web_client(context, zp):
             break
         await asyncio.sleep(0.5)
 
-    if re.search(r"/(j|w)/", zp.url):
-        new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
+    if mid:
+        target_url = f"https://app.zoom.us/wc/{mid}/join"
+        query = urllib.parse.urlparse(zp.url).query
+        if query:
+            target_url += f"?{query}"
+        log(f"Navigating to canonical Zoom web client URL: {mask_url(target_url)}")
+        await zp.goto(target_url, wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        log(f"After rewrite URL: {mask_url(zp.url)}")
+    elif re.search(r"/(j|w)/", zp.url):
+        new_url = re.sub(r"/(j|w)/(\d+)", r"/wc/\2/join", zp.url, count=1)
         log("Rewriting Zoom link to the web client")
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
@@ -613,6 +624,9 @@ async def ensure_muted(zp) -> None:
 
 
 async def click_prejoin_join(zp) -> bool:
+    if re.search(r"app\.zoom\.us/wc/?$", zp.url):
+        return False
+
     for frame in zp.frames:
         for sel in [
             "button.preview-join-button",
@@ -645,7 +659,7 @@ async def click_prejoin_join(zp) -> bool:
             for i in range(count):
                 b = btns.nth(i)
                 txt = (await b.inner_text() or "").strip()
-                if re.fullmatch(r"join|join meeting", txt, re.I):
+                if re.fullmatch(r"^join$", txt, re.I):
                     box = await b.bounding_box()
                     if box and box["y"] > 250:
                         await b.scroll_into_view_if_needed()
@@ -661,13 +675,21 @@ async def click_prejoin_join(zp) -> bool:
     return False
 
 
-async def zoom_prejoin(zp) -> None:
+async def zoom_prejoin(zp, meeting_id: str = "") -> None:
+    target_url = f"https://app.zoom.us/wc/{meeting_id}/join" if meeting_id else ""
     deadline = time.monotonic() + 60
     clicked_join = False
     while time.monotonic() < deadline:
         if await in_meeting(zp):
             clicked_join = True
             break
+
+        if target_url and re.search(r"app\.zoom\.us/wc/?$", zp.url):
+            log(f"Recovering to canonical web client: {mask_url(target_url)}")
+            await zp.goto(target_url, wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+            continue
+
         await click_browser_join(zp)
         await dismiss_popups(zp)
         await ensure_muted(zp)
@@ -803,8 +825,9 @@ async def in_meeting(zp) -> bool:
     return False
 
 
-async def wait_in_meeting(zp, max_wait: int = 300) -> None:
+async def wait_in_meeting(zp, meeting_id: str = "", max_wait: int = 300) -> None:
     """Wait through the waiting room; start recording only once inside."""
+    target_url = f"https://app.zoom.us/wc/{meeting_id}/join" if meeting_id else ""
     deadline = time.monotonic() + max_wait
     started_wait = time.monotonic()
     last_diag = -60.0
@@ -813,6 +836,13 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         text = await page_text(zp)
         if END_RE.search(text):
             raise RuntimeError("Meeting ended before the recording could start")
+
+        if target_url and re.search(r"app\.zoom\.us/wc/?$", zp.url):
+            log(f"Recovering to canonical web client: {mask_url(target_url)}")
+            await zp.goto(target_url, wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+            continue
+
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
             await dismiss_popups(zp)
@@ -1069,9 +1099,12 @@ async def main() -> int:
                 await open_todays_classes(page)
                 zoom_page = await wait_and_join(context, page)
 
+                m = re.search(r"/(?:j|w|wc)/(\d+)", zoom_page.url) or re.search(r"(\d{9,11})", zoom_page.url)
+                mid = m.group(1) if m else ""
+
                 zoom_page = await to_web_client(context, zoom_page)
-                await zoom_prejoin(zoom_page)
-                await wait_in_meeting(zoom_page)
+                await zoom_prejoin(zoom_page, meeting_id=mid)
+                await wait_in_meeting(zoom_page, meeting_id=mid)
                 await join_audio(zoom_page)
 
                 await dismiss_popups(zoom_page)
