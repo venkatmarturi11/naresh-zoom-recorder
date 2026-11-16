@@ -122,6 +122,8 @@ CHROMIUM_ARGS = [
     "--autoplay-policy=no-user-gesture-required",
     "--no-first-run",
     "--disable-features=Translate",
+    # Suppress "Open xdg-open?" protocol handler dialog
+    "--disable-external-intent-requests",
 ]
 
 
@@ -562,10 +564,10 @@ async def click_browser_join(zp) -> bool:
 
 async def _has_webclient(context, zp):
     for p in context.pages:
-        if "/wc/" in p.url:
+        if re.search(r"/wc/\d+", p.url):
             return p
         for f in p.frames:
-            if "/wc/" in f.url:
+            if re.search(r"/wc/\d+", f.url):
                 return p
     return None
 
@@ -597,9 +599,11 @@ async def to_web_client(context, zp):
             break
         await asyncio.sleep(0.5)
 
-    if re.search(r"/(j|w)/", zp.url):
-        new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
-        log("Rewriting Zoom link to the web client")
+    m = re.search(r"/(j|w)/(\d+)", zp.url)
+    if m:
+        mid = m.group(2)
+        new_url = f"https://app.zoom.us/wc/{mid}/join"
+        log(f"Rewriting Zoom link to the web client: {mask_url(new_url)}")
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
         log(f"After rewrite URL: {mask_url(zp.url)}")
@@ -721,12 +725,22 @@ POPUP_PATTERNS = [
 async def dismiss_popups(zp) -> None:
     await click_any(zp, POPUP_PATTERNS)
     for frame in zp.frames:
+        # Click OK button in Zoom modals (e.g. "This meeting is being recorded")
         try:
-            ok_btn = frame.locator(".zm-modal button:has-text('OK'), [role='dialog'] button:has-text('OK'), button:has-text('OK')").first
+            ok_btn = frame.locator(
+                ".zm-modal button:has-text('OK'), "
+                "[role='dialog'] button:has-text('OK'), "
+                ".recording-disclaimer-dialog button:has-text('OK'), "
+                "[class*='recording'] button:has-text('OK'), "
+                "button.zm-btn--primary:has-text('OK'), "
+                "button:has-text('OK')"
+            ).first
             if await ok_btn.count() and await ok_btn.is_visible():
                 await ok_btn.click(timeout=800)
+                log("Dismissed popup (OK button)")
         except Exception:
             pass
+        # Click close buttons on dialogs (but not Leave/End buttons)
         try:
             close_btn = frame.locator(
                 "[role='dialog'] button[aria-label*='close' i], "
@@ -737,23 +751,33 @@ async def dismiss_popups(zp) -> None:
                 label = (await close_btn.get_attribute("aria-label") or "").lower()
                 if not re.search(r"leave|end|exit", label):
                     await close_btn.click(timeout=800)
+                    log("Dismissed popup (close button)")
         except Exception:
             continue
-    try:
-        await zp.evaluate("""() => {
-            document.querySelectorAll('[role="dialog"], .zm-modal, div').forEach(el => {
-                if ((el.innerText || '').toLowerCase().includes('meeting is being recorded')) {
-                    const b = el.querySelector('button');
-                    if (b) try { b.click(); } catch(e) {}
+    # JS-based fallback: find and dismiss recording consent modals + remove backdrops
+    for frame in zp.frames:
+        try:
+            await frame.evaluate("""() => {
+                document.querySelectorAll('[role="dialog"], .zm-modal, div').forEach(el => {
+                    if ((el.innerText || '').toLowerCase().includes('meeting is being recorded')) {
+                        const btns = el.querySelectorAll('button');
+                        for (const b of btns) {
+                            if (/ok|got it|i agree/i.test(b.textContent.trim())) {
+                                try { b.click(); } catch(e) {}
+                                break;
+                            }
+                        }
+                        // If no matching text button, click the first button
+                        if (btns.length) try { btns[0].click(); } catch(e) {}
+                        try { el.remove(); } catch(e) {}
+                    }
+                });
+                document.querySelectorAll('.zm-modal-backdrop, .modal-backdrop').forEach(el => {
                     try { el.remove(); } catch(e) {}
-                }
-            });
-            document.querySelectorAll('.zm-modal-backdrop, .modal-backdrop').forEach(el => {
-                try { el.remove(); } catch(e) {}
-            });
-        }""")
-    except Exception:
-        pass
+                });
+            }""")
+        except Exception:
+            pass
 
 
 async def in_meeting(zp) -> bool:
@@ -990,6 +1014,13 @@ async def main() -> int:
         (prof_dir / "Default" / "Preferences").write_text(json.dumps({
             "protocol_handler": {
                 "excluded_schemes": {"zoommtg": True, "zoomus": True, "zoom": True}
+            },
+            "custom_handlers": {
+                "ignored_protocol_handlers": [
+                    {"protocol": "zoommtg", "url": ""},
+                    {"protocol": "zoomus", "url": ""},
+                    {"protocol": "zoom", "url": ""}
+                ]
             }
         }))
 
@@ -1006,8 +1037,18 @@ async def main() -> int:
             await context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
                 "window.chrome = window.chrome || { runtime: {} };"
+                # Block zoommtg:// zoomus:// zoom:// protocol navigations entirely
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
+                # Intercept link clicks that trigger external protocol handlers
+                "document.addEventListener('click',function(e){"
+                "  var a=e.target.closest&&e.target.closest('a');"
+                "  if(a&&a.href&&/^zoom(mtg|us)?:/i.test(a.href)){e.preventDefault();e.stopPropagation();}"
+                "},true);"
+                # Override location.assign and location.replace for zoom protocols
+                "const _assign=location.assign.bind(location),_replace=location.replace.bind(location);"
+                "location.assign=function(u){if(u&&/^zoom(mtg|us)?:/i.test(String(u)))return;_assign(u)};"
+                "location.replace=function(u){if(u&&/^zoom(mtg|us)?:/i.test(String(u)))return;_replace(u)};"
             )
             await context.route(
                 re.compile(r"^zoom(mtg|us)?://", re.I),
