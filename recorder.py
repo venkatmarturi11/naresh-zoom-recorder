@@ -110,6 +110,15 @@ WAITING_ROOM_RE = re.compile(
     r"wait for the host|host to let you in|waiting to be admitted)",
     re.I,
 )
+SIGNIN_URL_RE = re.compile(r"(/signin|/google_oauth|accounts\.google|facebook\.com|appleid\.apple|login\.microsoftonline|/saml|/sso|/meeting/register)", re.I)
+SIGNIN_TEXT_RE = re.compile(
+    r"(sign in to (join|continue)|sign in with (apple|google|facebook|sso|microsoft)|"
+    r"authorized attendees|only authenticated users|authenticated users can join|"
+    r"sign in to zoom|forgot password|sign in with sso)",
+    re.I,
+)
+ZOOM_EMAIL = _env("ZOOM_EMAIL")
+ZOOM_PASS = _env("ZOOM_PASS")
 POST_MEETING_URL_RE = re.compile(r"(postattendee|/wc/leave|/leave\b|/meeting/end)", re.I)
 
 HIDE_CSS = """
@@ -150,7 +159,7 @@ def log(msg: str) -> None:
 
 def redact(text: str) -> str:
     """Strip secrets from anything that might be logged or sent to Telegram."""
-    for secret in (PORTAL_PASS, TG_BOT_TOKEN, TG_API_HASH):
+    for secret in (PORTAL_PASS, ZOOM_PASS, TG_BOT_TOKEN, TG_API_HASH):
         if secret:
             text = text.replace(secret, "***")
     return text
@@ -222,8 +231,14 @@ def _bot_photo(path: str, caption: str) -> None:
 async def notify_photo(zp, caption: str) -> None:
     try:
         shot = "/tmp/zoom_debug.png"
-        await zp.screenshot(path=shot)
-        await asyncio.to_thread(_bot_photo, shot, caption)
+        for attempt in (1, 2):
+            try:
+                await zp.screenshot(path=shot, timeout=10000)
+                await asyncio.wait_for(asyncio.to_thread(_bot_photo, shot, caption), 45)
+                return
+            except Exception as e:
+                log(f"Telegram screenshot failed ({type(e).__name__}, try {attempt})")
+                await asyncio.sleep(2)
     except Exception as e:
         log(f"Telegram screenshot failed ({type(e).__name__})")
 
@@ -695,10 +710,14 @@ async def click_prejoin_join(zp) -> bool:
 async def zoom_prejoin(zp) -> None:
     deadline = time.monotonic() + 60
     clicked_join = False
+    email_val = ZOOM_EMAIL or (PORTAL_USER if "@" in PORTAL_USER else f"{PORTAL_USER}@gmail.com")
+
     while time.monotonic() < deadline:
         if await in_meeting(zp):
             clicked_join = True
             break
+        if await on_signin_page(zp):
+            break  # wait_in_meeting handles it
         await click_browser_join(zp)
         await dismiss_popups(zp)
         await ensure_muted(zp)
@@ -717,7 +736,20 @@ async def zoom_prejoin(zp) -> None:
                         log(f"Filled participant name: {PARTICIPANT_NAME}")
                         await name_in.press("Enter")
             except Exception:
-                continue
+                pass
+
+            try:
+                email_in = frame.locator(
+                    "input#inputemail, input[name='inputemail'], input#email, "
+                    "input[name='email'], input[placeholder*='email' i]"
+                ).first
+                if await email_in.count() and await email_in.is_visible():
+                    val = await email_in.input_value()
+                    if not val.strip():
+                        await email_in.fill(email_val)
+                        log(f"Filled participant email: {redact(email_val)}")
+            except Exception:
+                pass
 
         if await click_prejoin_join(zp):
             clicked_join = True
@@ -752,21 +784,63 @@ POPUP_PATTERNS = [
 ]
 
 
+class SigninRequired(RuntimeError):
+    pass
+
+
+async def on_signin_page(zp) -> bool:
+    """True when Zoom (or an external IdP) is showing a sign-in page instead of the meeting."""
+    try:
+        if SIGNIN_URL_RE.search(zp.url):
+            return True
+    except Exception:
+        return False
+    text = await page_text(zp)
+    return bool(SIGNIN_TEXT_RE.search(text))
+
+
+async def zoom_signin(zp) -> bool:
+    """Optional: sign in with a dedicated Zoom account (ZOOM_EMAIL / ZOOM_PASS secrets)."""
+    if not (ZOOM_EMAIL and ZOOM_PASS):
+        return False
+    try:
+        email = zp.locator("input#email, input[name='account'], input[type='email']").first
+        pwd = zp.locator("input#password, input[type='password']").first
+        await email.wait_for(state="visible", timeout=8000)
+        await email.fill(ZOOM_EMAIL)
+        if not await pwd.is_visible():
+            await email.press("Enter")
+            await pwd.wait_for(state="visible", timeout=8000)
+        await pwd.fill(ZOOM_PASS)
+        await pwd.press("Enter")
+        await asyncio.sleep(5)
+        log("Submitted Zoom sign-in form")
+        return True
+    except Exception as e:
+        log(f"Zoom sign-in attempt failed ({type(e).__name__})")
+        return False
+
+
 async def dismiss_popups(zp) -> None:
     """Dismiss any consent, disclaimer, recording, or audio modals in Zoom or the browser."""
-    # 1. Playwright locators for OK / consent buttons on modals
+    # Never click anything on a sign-in page (it would hit Google/Facebook/Apple buttons)
+    if await on_signin_page(zp):
+        return
+    # 1. Playwright locators for OK / consent buttons on modals.
+    #    text-is = exact, case-insensitive full-text match (has-text is a SUBSTRING match,
+    #    so 'OK' used to match 'Facebook').
     for frame in zp.frames:
         for selector in [
-            ".zm-modal button:has-text('OK')",
-            "[role='dialog'] button:has-text('OK')",
-            "button.zm-btn--primary:has-text('OK')",
-            "button:has-text('OK')",
-            "button:has-text('Got it')",
-            "button:has-text('I Agree')",
-            "button:has-text('Stay in Meeting')",
-            "button:has-text('Agree')",
-            "button:has-text('Continue')",
-            "button:has-text('Stay muted')",
+            ".zm-modal button:text-is('OK')",
+            "[role='dialog'] button:text-is('OK')",
+            "button.zm-btn--primary:text-is('OK')",
+            "button:text-is('OK')",
+            "button:text-is('Got it')",
+            "button:text-is('I Agree')",
+            "button:text-is('Stay in Meeting')",
+            "button:text-is('Agree')",
+            "button:text-is('Stay muted')",
+            "[role='dialog'] button:text-is('Continue')",
             "[role='dialog'] button[aria-label*='close' i]",
             ".zm-modal button[aria-label*='close' i]",
             "button[aria-label='Close' i]",
@@ -775,7 +849,7 @@ async def dismiss_popups(zp) -> None:
                 btn = frame.locator(selector).first
                 if await btn.count() and await btn.is_visible():
                     label = (await btn.inner_text() or await btn.get_attribute("aria-label") or "").strip()
-                    if not re.search(r"\b(leave|end|exit)\b", label, re.I):
+                    if not re.search(r"\b(leave|end|exit|facebook|google|apple|microsoft|sso)\b", label, re.I):
                         await btn.click(force=True, timeout=1000)
                         log(f"Dismissed popup via {selector} (text='{label}')")
             except Exception:
@@ -839,24 +913,45 @@ async def dismiss_popups(zp) -> None:
 
 async def in_meeting(zp) -> bool:
     try:
+        host = urllib.parse.urlsplit(zp.url).netloc
+    except Exception:
+        return False
+    if "zoom." not in host or SIGNIN_URL_RE.search(zp.url):
+        return False
+    # Double-check page text: reject if sign-in / registration text is visible
+    text = await page_text(zp)
+    if SIGNIN_TEXT_RE.search(text):
+        return False
+    try:
         await zp.mouse.move(960, 1040)
     except Exception:
         pass
+    # Look for meeting-specific UI elements (not just canvas/video which exist on login pages)
     for frame in zp.frames:
         try:
-            loc = frame.locator(
+            meeting_ui = frame.locator(
                 "#wc-footer, #foot-bar, [class*='footer-chat'], "
-                "button[aria-label*='Leave' i], button:has-text('Leave'), "
+                "button[aria-label*='Leave' i], "
                 "button[aria-label*='Audio' i], button[aria-label*='Chat' i], "
                 "button[aria-label*='Participants' i], button[aria-label*='Reactions' i], "
-                "button[aria-label*='Raise Hand' i], button:has-text('Raise Hand'), "
-                "button[aria-label*='Q&A' i], button:has-text('Q&A'), "
+                "button[aria-label*='Raise Hand' i], "
+                "button[aria-label*='Q&A' i], "
                 "button[aria-label*='Share Screen' i], "
-                "canvas, video, [class*='speaker-active-container'], [class*='video-avatar'], "
+                "[class*='speaker-active-container'], [class*='video-avatar'], "
                 "[class*='meeting-client'], [id*='meeting-client'], "
                 "[class*='participants-section'], [class*='chat-container']"
             ).first
-            if await loc.count() and await loc.is_visible():
+            if await meeting_ui.count() and await meeting_ui.is_visible():
+                return True
+        except Exception:
+            continue
+    # Fallback: canvas/video ONLY if no sign-in indicators are present on the page
+    if re.search(r"(sign in|log in|create account|register|forgot password)", text, re.I):
+        return False
+    for frame in zp.frames:
+        try:
+            media = frame.locator("canvas, video").first
+            if await media.count() and await media.is_visible():
                 return True
         except Exception:
             continue
@@ -869,10 +964,20 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
     started_wait = time.monotonic()
     last_diag = -60.0
     sent_debug = False
+    signin_tries = 0
     while time.monotonic() < deadline:
         text = await page_text(zp)
         if END_RE.search(text):
             raise RuntimeError("Meeting ended before the recording could start")
+        if await on_signin_page(zp):
+            await notify_photo(zp, f"🔐 {CLASS_LABEL}: Zoom is asking for sign-in")
+            if signin_tries < 2 and await zoom_signin(zp):
+                signin_tries += 1
+                continue
+            raise SigninRequired(
+                "Zoom requires sign-in for this meeting (host enabled authenticated-only join). "
+                "Set ZOOM_EMAIL / ZOOM_PASS secrets for a Zoom account."
+            )
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
             await dismiss_popups(zp)
@@ -891,7 +996,7 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if elapsed >= 4 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 5 < 2:
             await click_prejoin_join(zp)
         await asyncio.sleep(2)
-    log("Could not confirm meeting UI; starting the recording anyway")
+    raise RuntimeError("Could not confirm meeting UI within the wait window; not recording")
 
 
 async def join_audio(zp) -> None:
