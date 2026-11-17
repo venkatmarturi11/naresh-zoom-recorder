@@ -672,14 +672,6 @@ async def click_prejoin_join(zp) -> bool:
                 if await btn.count() and await btn.is_visible():
                     await btn.scroll_into_view_if_needed()
                     await btn.click(force=True, timeout=1500)
-                    try:
-                        await btn.evaluate("b => { b.click(); if (b.form) b.form.submit(); }")
-                    except Exception:
-                        pass
-                    try:
-                        await btn.press("Enter")
-                    except Exception:
-                        pass
                     log(f"Clicked pre-join button ({sel})")
                     return True
             except Exception:
@@ -696,10 +688,6 @@ async def click_prejoin_join(zp) -> bool:
                     if box and box["y"] > 250:
                         await b.scroll_into_view_if_needed()
                         await b.click(force=True, timeout=1500)
-                        try:
-                            await b.evaluate("b => b.click()")
-                        except Exception:
-                            pass
                         log(f"Clicked pre-join button at y={box['y']:.0f}")
                         return True
         except Exception:
@@ -734,7 +722,6 @@ async def zoom_prejoin(zp) -> None:
                     if not val.strip():
                         await name_in.fill(PARTICIPANT_NAME)
                         log(f"Filled participant name: {PARTICIPANT_NAME}")
-                        await name_in.press("Enter")
             except Exception:
                 pass
 
@@ -765,23 +752,17 @@ async def zoom_prejoin(zp) -> None:
         log("Join button on the pre-join screen was not found; continuing anyway")
 
 
-POPUP_PATTERNS = [
-    r"^ok$",
-    r"^got it$",
-    r"^i agree$",
-    r"^agree$",
-    r"^stay in meeting$",
-    r"^stay muted$",
-    r"^continue$",
-    r"^accept( all)?( cookies)?$",
-    r"^allow( all)?( cookies)?$",
-    r"^dismiss$",
-    r"^skip$",
-    r"^not now$",
-    r"^maybe later$",
-    r"^no,? thanks$",
-    r"^continue without (audio|microphone)$",
-]
+POPUP_SAFE_RE = re.compile(
+    r"^(ok|got it|i agree|agree|stay in meeting|stay muted|continue|"
+    r"accept|accept all|allow|dismiss|skip|not now|maybe later|"
+    r"no,?\s*thanks|continue without (?:audio|microphone)|close)$",
+    re.I,
+)
+POPUP_DENY_RE = re.compile(
+    r"\b(leave|end|exit|facebook|google|apple|microsoft|sso|sign.?in|"
+    r"log.?in|register|create.?account|join|download|install)\b",
+    re.I,
+)
 
 
 class SigninRequired(RuntimeError):
@@ -821,84 +802,129 @@ async def zoom_signin(zp) -> bool:
         return False
 
 
+def _is_safe_button(label: str) -> bool:
+    """True if the button text is a known safe popup-dismiss action."""
+    label = label.strip()
+    if not label or len(label) > 50:
+        return False
+    return bool(POPUP_SAFE_RE.match(label)) and not POPUP_DENY_RE.search(label)
+
+
 async def dismiss_popups(zp) -> None:
-    """Dismiss any consent, disclaimer, recording, or audio modals in Zoom or the browser."""
-    # Never click anything on a sign-in page (it would hit Google/Facebook/Apple buttons)
+    """Dismiss any consent, disclaimer, recording, or audio modals in Zoom.
+
+    Safety layers (all three must pass before a click):
+      1. Bail entirely if the page is a sign-in / registration page.
+      2. Button text must match POPUP_SAFE_RE (exact whitelist).
+      3. Button text must NOT match POPUP_DENY_RE (deny-list for SSO/nav buttons).
+    """
+    # ── Gate: never click anything on a sign-in / registration page ──
     if await on_signin_page(zp):
         return
-    # 1. Playwright locators for OK / consent buttons on modals.
-    #    text-is = exact, case-insensitive full-text match (has-text is a SUBSTRING match,
-    #    so 'OK' used to match 'Facebook').
+
+    dismissed_ids: set[str] = set()  # de-duplicate across Playwright + JS passes
+
+    # ── Pass 1: Playwright locators (precise, per-frame) ──
+    # Scoped selectors first (inside a modal/dialog), then broad fallback.
+    SCOPED = [
+        ".zm-modal button",
+        "[role='dialog'] button",
+        ".modal-dialog button",
+        "[class*='modal'] button",
+        "[class*='disclaimer'] button",
+        "button.zm-btn--primary",
+        "button.zm-btn",
+    ]
+    CLOSE_BTNS = [
+        "[role='dialog'] button[aria-label*='close' i]",
+        ".zm-modal button[aria-label*='close' i]",
+        "button.zm-modal__header-close",
+        "button[aria-label='Close' i]",
+    ]
     for frame in zp.frames:
-        for selector in [
-            ".zm-modal button:text-is('OK')",
-            "[role='dialog'] button:text-is('OK')",
-            "button.zm-btn--primary:text-is('OK')",
-            "button:text-is('OK')",
-            "button:text-is('Got it')",
-            "button:text-is('I Agree')",
-            "button:text-is('Stay in Meeting')",
-            "button:text-is('Agree')",
-            "button:text-is('Stay muted')",
-            "[role='dialog'] button:text-is('Continue')",
-            "[role='dialog'] button[aria-label*='close' i]",
-            ".zm-modal button[aria-label*='close' i]",
-            "button[aria-label='Close' i]",
-        ]:
+        # 1a. Buttons inside modals/dialogs — click if text is safe
+        for scope in SCOPED:
             try:
-                btn = frame.locator(selector).first
-                if await btn.count() and await btn.is_visible():
-                    label = (await btn.inner_text() or await btn.get_attribute("aria-label") or "").strip()
-                    if not re.search(r"\b(leave|end|exit|facebook|google|apple|microsoft|sso)\b", label, re.I):
-                        await btn.click(force=True, timeout=1000)
-                        log(f"Dismissed popup via {selector} (text='{label}')")
+                buttons = frame.locator(scope)
+                count = await buttons.count()
+                for i in range(min(count, 10)):
+                    btn = buttons.nth(i)
+                    if not await btn.is_visible():
+                        continue
+                    label = ""
+                    try:
+                        label = (await btn.inner_text(timeout=500) or "").strip()
+                    except Exception:
+                        try:
+                            label = (await btn.get_attribute("aria-label") or "").strip()
+                        except Exception:
+                            continue
+                    btn_id = f"{scope}:{label}"
+                    if btn_id in dismissed_ids:
+                        continue
+                    if _is_safe_button(label):
+                        await btn.click(force=True, timeout=1500)
+                        dismissed_ids.add(btn_id)
+                        log(f"Dismissed popup: '{label}' (via {scope})")
             except Exception:
                 continue
 
-    # 2. Comprehensive JavaScript DOM evaluation across all frames
+        # 1b. Close (×) buttons on modals
+        for sel in CLOSE_BTNS:
+            try:
+                btn = frame.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(force=True, timeout=1500)
+                    log(f"Dismissed popup via close button ({sel})")
+            except Exception:
+                continue
+
+    # ── Pass 2: JavaScript DOM sweep (catches elements Playwright misses) ──
     js_dismiss = """
     () => {
+        const SAFE = /^(ok|got it|i agree|agree|stay in meeting|stay muted|continue|accept|dismiss|close)$/i;
+        const DENY = /\\b(leave|end|exit|facebook|google|apple|microsoft|sso|sign.?in|log.?in|register|create|join|download|install)\\b/i;
         let dismissed = 0;
-        // A. Look for any dialog / modal with recording / consent / notice text
-        const dialogs = document.querySelectorAll(
+
+        // A. Dialogs / Modals: click safe buttons
+        const dlgs = document.querySelectorAll(
             '[role="dialog"], .zm-modal, .modal-dialog, [class*="modal"], [class*="disclaimer"], [class*="dialog"]'
         );
-        for (const dlg of dialogs) {
-            const text = (dlg.innerText || '').toLowerCase();
-            if (
-                text.includes('recording') ||
-                text.includes('recorded') ||
-                text.includes('transcript') ||
-                text.includes('terms of service') ||
-                text.includes('camera') ||
-                text.includes('microphone') ||
-                text.includes('cookie')
-            ) {
-                const btns = dlg.querySelectorAll('button, [role="button"], a.zm-btn, .zm-btn');
-                for (const b of btns) {
-                    const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    if (/^(ok|got it|i agree|agree|stay in meeting|continue|close)$/i.test(bText)) {
-                        try { b.click(); dismissed++; } catch(e) {}
-                    }
+        for (const dlg of dlgs) {
+            for (const b of dlg.querySelectorAll('button, [role="button"], .zm-btn')) {
+                const bt = (b.innerText || b.textContent || '').trim();
+                if (SAFE.test(bt) && !DENY.test(bt)) {
+                    try { b.click(); dismissed++; } catch(e) {}
                 }
-                try { dlg.remove(); dismissed++; } catch(e) {}
+            }
+            const text = (dlg.innerText || '').toLowerCase();
+            if (/recording|recorded|transcript|terms of service|camera|microphone|cookie|consent|privacy|disclaimer/i.test(text)) {
+                try { dlg.style.display = 'none'; dismissed++; } catch(e) {}
             }
         }
 
-        // B. Remove backdrops / overlay blockers
-        document.querySelectorAll(
-            '.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*="backdrop"], [class*="overlay-shade"]'
-        ).forEach(el => {
-            try { el.remove(); dismissed++; } catch(e) {}
-        });
-
-        // C. Universal click on any visible OK or Got it button
-        for (const b of document.querySelectorAll('button, [role="button"], .zm-btn')) {
-            const bText = (b.innerText || b.textContent || '').trim().toLowerCase();
-            if (bText === 'ok' || bText === 'got it') {
+        // B. Primary Zoom buttons with safe text across the page
+        for (const b of document.querySelectorAll('.zm-btn--primary, button.zm-btn')) {
+            const bt = (b.innerText || b.textContent || '').trim();
+            if (SAFE.test(bt) && !DENY.test(bt)) {
                 try { b.click(); dismissed++; } catch(e) {}
             }
         }
+
+        // C. Remove backdrops / overlay blockers
+        for (const el of document.querySelectorAll(
+            '.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*="backdrop"], [class*="overlay-shade"]'
+        )) {
+            try { el.remove(); dismissed++; } catch(e) {}
+        }
+
+        // D. Notifications / toasts (hide, don't click)
+        for (const el of document.querySelectorAll(
+            '.zm-notification, [class*="toast"], [class*="Toast"], [class*="notification"], [role="alert"]'
+        )) {
+            try { el.style.display = 'none'; dismissed++; } catch(e) {}
+        }
+
         return dismissed;
     }
     """
@@ -906,7 +932,7 @@ async def dismiss_popups(zp) -> None:
         try:
             d_count = await frame.evaluate(js_dismiss)
             if d_count:
-                log(f"Cleared {d_count} popup element(s)")
+                log(f"Cleared {d_count} popup element(s) via JS")
         except Exception:
             pass
 
