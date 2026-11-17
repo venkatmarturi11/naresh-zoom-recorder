@@ -843,10 +843,13 @@ async def in_meeting(zp) -> bool:
         try:
             loc = frame.locator(
                 "#wc-footer, #foot-bar, [class*='footer-chat'], "
-                "button[aria-label*='Participants' i], button[aria-label*='Chat' i], "
-                "button[aria-label*='Reactions' i], button[aria-label*='Share Screen' i], "
-                "button[aria-label*='Share screen' i], "
-                "[class*='speaker-active-container'], [class*='video-avatar'], "
+                "button[aria-label*='Leave' i], button:has-text('Leave'), "
+                "button[aria-label*='Audio' i], button[aria-label*='Chat' i], "
+                "button[aria-label*='Participants' i], button[aria-label*='Reactions' i], "
+                "button[aria-label*='Raise Hand' i], button:has-text('Raise Hand'), "
+                "button[aria-label*='Q&A' i], button:has-text('Q&A'), "
+                "button[aria-label*='Share Screen' i], "
+                "canvas, video, [class*='speaker-active-container'], [class*='video-avatar'], "
                 "[class*='meeting-client'], [id*='meeting-client'], "
                 "[class*='participants-section'], [class*='chat-container']"
             ).first
