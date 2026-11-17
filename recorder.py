@@ -22,7 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -56,14 +56,93 @@ TG_API_HASH = _env("TG_API_HASH")
 TG_BOT_TOKEN = _env("TG_BOT_TOKEN")
 TG_CHAT_ID = _env("TG_CHAT_ID")
 
-CLASS_KEYWORD = _env("CLASS_KEYWORD", "React JS")
-CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
-CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "90"))
+CLASS_KEYWORD = _env("CLASS_KEYWORD", "auto")
+CLASS_START = _env("CLASS_START", "")  # HH:MM, IST (empty for auto/profile default)
+CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "0") or "0")
 MAX_WAIT_MIN = int(_env("MAX_WAIT_MIN", "45"))  # wait for Join to activate
-MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", str(CLASS_DURATION_MIN * 60)))  # 90 min default
+MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", "5400"))  # 90 min default
 PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (
     PORTAL_USER.split("@")[0] if "@" in PORTAL_USER else "Student"
 )
+
+CLASS_PROFILES = {
+    "advance_java": {
+        "name": "Advance Java",
+        "pattern": r"adv(ance|anced)?\s*java|\bjava\b",
+        "start": "18:00",
+        "duration_min": 90,
+        "hard_end": "19:28",  # strictly end before 19:30 so React JS can start!
+    },
+    "react_js": {
+        "name": "React JS",
+        "pattern": r"react(\s*js)?",
+        "start": "19:30",
+        "duration_min": 90,
+        "hard_end": "21:15",
+    },
+}
+
+
+def resolve_class_profile(keyword: str, start: str = "", duration: int = 0) -> dict:
+    kw = (keyword or "").strip()
+    st = (start or "").strip()
+    dur = duration if duration > 0 else None
+
+    # Auto mode: select based on current IST time
+    if not kw or kw.lower() == "auto":
+        now_time = datetime.now(IST).time()
+        # 16:30 to 19:15 IST -> Advance Java (6:00 PM)
+        # 19:15 to 22:00 IST -> React JS (7:30 PM)
+        if dtime(16, 30) <= now_time < dtime(19, 15):
+            chosen = "advance_java"
+        elif dtime(19, 15) <= now_time < dtime(22, 0):
+            chosen = "react_js"
+        else:
+            chosen = "advance_java" if now_time < dtime(18, 0) else "react_js"
+
+        prof = dict(CLASS_PROFILES[chosen])
+        if st:
+            prof["start"] = st
+        if dur:
+            prof["duration_min"] = dur
+        return prof
+
+    kw_lower = kw.lower()
+    if "java" in kw_lower:
+        prof = dict(CLASS_PROFILES["advance_java"])
+        if kw:
+            prof["name"] = kw
+        if st:
+            prof["start"] = st
+        if dur:
+            prof["duration_min"] = dur
+        return prof
+
+    if "react" in kw_lower:
+        prof = dict(CLASS_PROFILES["react_js"])
+        if kw:
+            prof["name"] = kw
+        if st:
+            prof["start"] = st
+        if dur:
+            prof["duration_min"] = dur
+        return prof
+
+    # Custom class
+    return {
+        "name": kw,
+        "pattern": re.escape(kw),
+        "start": st or "19:30",
+        "duration_min": dur or 90,
+        "hard_end": None,
+    }
+
+
+def get_classes_to_record(keyword: str, start: str = "", duration: int = 0) -> list[dict]:
+    kw = (keyword or "").strip().lower()
+    if kw in ("all", "both"):
+        return [dict(CLASS_PROFILES["advance_java"]), dict(CLASS_PROFILES["react_js"])]
+    return [resolve_class_profile(keyword, start, duration)]
 
 RECORD_PATH = _env("RECORD_PATH", "/tmp/class_recording.mp4")
 FFMPEG_LOG = "/tmp/ffmpeg.log"
@@ -152,8 +231,9 @@ def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def class_start_dt() -> datetime:
-    hh, mm = (int(x) for x in CLASS_START.split(":"))
+def class_start_dt(start_str: str = "") -> datetime:
+    s = start_str or CLASS_START or "19:30"
+    hh, mm = (int(x) for x in s.split(":"))
     return datetime.now(IST).replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
@@ -410,14 +490,15 @@ async def open_todays_classes(page) -> None:
     await dismiss_popups(page)
 
 
-def card_locator(page):
+def card_locator(page, pattern: str = ""):
+    pat = pattern or (CLASS_KEYWORD if CLASS_KEYWORD != "auto" else r"react|java")
     join_any = page.locator("a, button, [role='button']").filter(
         has_text=re.compile(r"\bjoin\b", re.I)
     )
     # .last = innermost matching element (outer wrappers also match)
     return (
         page.locator("div, li, tr, article, section")
-        .filter(has_text=re.compile(re.escape(CLASS_KEYWORD), re.I))
+        .filter(has_text=re.compile(pat, re.I))
         .filter(has=join_any)
         .last
     )
@@ -450,27 +531,46 @@ async def join_ready(btn) -> bool:
 # --------------------------------------------------------------------------
 # State 3: precision Join-button polling
 # --------------------------------------------------------------------------
-async def wait_and_join(context, page):
-    start_dt = class_start_dt()
+async def wait_and_join(context, page, prof: dict | None = None):
+    prof = prof or resolve_class_profile(CLASS_KEYWORD, CLASS_START, CLASS_DURATION_MIN)
+    class_name = prof["name"]
+    pattern = prof["pattern"]
+    class_start = prof["start"]
+
+    start_dt = class_start_dt(class_start)
     reload_until = start_dt - timedelta(seconds=15)
     deadline = time.monotonic() + MAX_WAIT_MIN * 60
     last_reload = time.monotonic()
     reloaded_at_start = False
     early_click_failed = False
-    log(f"Waiting for the Join button (class start {CLASS_START} IST)")
+
+    # Grace period: if a card is completely absent from Today's Classes,
+    # wait until start_dt + 5 minutes (or 5 minutes from now if already past start_dt)
+    # before concluding the class is not scheduled for today.
+    now = datetime.now(IST)
+    card_search_deadline = max(
+        start_dt + timedelta(minutes=5),
+        now + timedelta(minutes=5),
+    )
+
+    log(f"Waiting for '{class_name}' Join button (class start {class_start} IST)")
 
     while time.monotonic() < deadline:
         now = datetime.now(IST)
-        card = card_locator(page)
+        card = card_locator(page, pattern)
         try:
             found = await card.count() > 0
         except Exception:
             found = False
 
+        if not found and now >= card_search_deadline:
+            log(f"'{class_name}' card was not found in Today's Classes on the portal")
+            return None
+
         if found and (now >= start_dt or not early_click_failed):
             btn = join_button(card)
             if await join_ready(btn):
-                log("Join button is active; clicking")
+                log(f"Join button for '{class_name}' is active; clicking")
                 prev_url = page.url
                 zp = await click_join(
                     context, page, btn, wait_sec=25 if now >= start_dt else 12
@@ -479,7 +579,7 @@ async def wait_and_join(context, page):
                     return zp
                 if now < start_dt:
                     early_click_failed = True
-                    log(f"Join did not open Zoom yet; waiting until {CLASS_START} IST")
+                    log(f"Join did not open Zoom yet; waiting until {class_start} IST")
                 else:
                     log("Join click did not open Zoom yet; retrying after reload")
                 try:
@@ -497,7 +597,7 @@ async def wait_and_join(context, page):
         since_reload = time.monotonic() - last_reload
         need_reload = False
         if now < reload_until and since_reload >= 15:
-            need_reload = True  # lightweight refresh every 15 s until 7:29:45
+            need_reload = True  # lightweight refresh every 15 s until start - 15s
         elif now >= start_dt and not reloaded_at_start:
             need_reload = True  # one refresh exactly at the start time
             reloaded_at_start = True
@@ -516,9 +616,8 @@ async def wait_and_join(context, page):
 
         await asyncio.sleep(1.5 if now < reload_until else 1.0)
 
-    raise TimeoutError(
-        f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} minutes"
-    )
+    log(f"Join button for '{class_name}' did not become active within {MAX_WAIT_MIN} minutes")
+    return None
 
 
 async def click_join(context, page, btn, wait_sec: int = 25):
@@ -881,11 +980,16 @@ async def go_fullscreen(zp) -> None:
 # --------------------------------------------------------------------------
 # State 6: meeting monitor
 # --------------------------------------------------------------------------
-async def monitor(zp, started: float) -> str:
+async def monitor(
+    zp, started: float, max_sec: int = MAX_MEETING_SEC, hard_end_dt: datetime | None = None
+) -> str:
     failures = 0
     last_housekeeping = 0.0
     while True:
-        if time.monotonic() - started >= MAX_MEETING_SEC:
+        now_dt = datetime.now(IST)
+        if hard_end_dt and now_dt >= hard_end_dt:
+            return f"hard end cutoff reached ({hard_end_dt.strftime('%H:%M')} IST)"
+        if time.monotonic() - started >= max_sec:
             return "maximum duration reached"
         if zp.is_closed():
             return "Zoom tab closed"
@@ -958,15 +1062,16 @@ def _chat_id():
     return int(TG_CHAT_ID) if re.fullmatch(r"-?\d+", TG_CHAT_ID) else TG_CHAT_ID
 
 
-async def upload_to_telegram(path: str) -> None:
+async def upload_to_telegram(path: str, caption_title: str = "") -> None:
     from pyrogram import Client
     from pyrogram.errors import FloodWait
 
+    title = caption_title or (CLASS_KEYWORD if CLASS_KEYWORD != "auto" else "Class")
     size = os.path.getsize(path)
     parts = [path] if size <= TG_SIZE_LIMIT else await asyncio.to_thread(split_file, path)
     total = len(parts)
-    base_caption = f"🎥 {CLASS_KEYWORD} | {datetime.now(IST).strftime('%Y-%m-%d')}"
-    log(f"Uploading {total} file(s), {size / 1024**3:.2f} GB total")
+    base_caption = f"🎥 {title} | {datetime.now(IST).strftime('%Y-%m-%d')}"
+    log(f"Uploading {total} file(s) for {title}, {size / 1024**3:.2f} GB total")
 
     async with Client(
         "recorder", api_id=int(TG_API_ID), api_hash=TG_API_HASH,
@@ -994,6 +1099,87 @@ async def upload_to_telegram(path: str) -> None:
                     await asyncio.sleep(5 * attempt)
 
 
+async def record_single_class(context, page, prof: dict, out_path: str) -> bool:
+    class_name = prof["name"]
+    pattern = prof["pattern"]
+    class_start = prof["start"]
+    duration_min = prof["duration_min"]
+    hard_end = prof.get("hard_end")
+
+    max_sec = duration_min * 60
+    hard_end_dt = None
+    if hard_end:
+        eh, em = (int(x) for x in hard_end.split(":"))
+        hard_end_dt = datetime.now(IST).replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # 1. Ensure Today's Classes tab is open
+    await open_todays_classes(page)
+
+    # 2. Wait and join
+    zoom_page = await wait_and_join(context, page, prof)
+    if zoom_page is None:
+        log(f"'{class_name}' is not scheduled in Today's Classes on the portal. Skipping.")
+        await notify(f"ℹ️ '{class_name}' is not on the portal today. Nothing to record.")
+        return False
+
+    # 3. Web client navigation & prejoin
+    zoom_page = await to_web_client(context, zoom_page)
+    await zoom_prejoin(zoom_page)
+    await wait_in_meeting(zoom_page)
+    await join_audio(zoom_page)
+    await dismiss_popups(zoom_page)
+
+    # 4. Start recording with safe finalize
+    recorder = FFmpegRecorder(out_path)
+    recorder.start()
+    started = time.monotonic()
+    log(f"Recording started for {class_name}")
+    await notify(f"✅ Joined {class_name} & started 1080p recording")
+
+    try:
+        # Send screenshot 10s into recording to verify content
+        await asyncio.sleep(10)
+        await notify_photo(zoom_page, f"🎥 {class_name}: Recording in progress")
+
+        # 5. Fullscreen & monitor
+        await go_fullscreen(zoom_page)
+        end_reason = await monitor(zoom_page, started, max_sec, hard_end_dt)
+        elapsed_min = (time.monotonic() - started) / 60
+        log(f"{class_name} recording ends: {end_reason} (after {elapsed_min:.1f} min)")
+        await notify(f"🛑 {class_name} recording ended: {end_reason} (after {elapsed_min:.1f} min)")
+    finally:
+        await asyncio.to_thread(recorder.stop)
+
+    # 6. Close Zoom page to clear session for next meeting
+    try:
+        await zoom_page.close()
+    except Exception:
+        pass
+
+    # 7. Upload to Telegram
+    out = Path(out_path)
+    if out.exists():
+        fsize = out.stat().st_size
+        log(f"{class_name} recording file size: {fsize / 1024**2:.1f} MB")
+        if fsize > 1_000_000:
+            try:
+                await upload_to_telegram(str(out), caption_title=class_name)
+                log(f"{class_name} uploaded to Telegram successfully")
+                return True
+            except Exception as e:
+                log(f"{class_name} Telegram upload failed ({type(e).__name__})")
+                await notify(f"⚠️ Alert: {class_name} upload failed ({type(e).__name__})")
+                return False
+        else:
+            log(f"{class_name} recording too small ({fsize} bytes), skipping upload")
+            await notify(f"⚠️ Alert: {class_name} file too small ({fsize / 1024:.0f} KB)")
+            return False
+    else:
+        log(f"No recording file found at {out_path} for {class_name}")
+        await notify(f"⚠️ Alert: no recording file produced for {class_name}")
+        return False
+
+
 # --------------------------------------------------------------------------
 # Main flow
 # --------------------------------------------------------------------------
@@ -1010,10 +1196,13 @@ async def main() -> int:
     except (NotImplementedError, RuntimeError):
         pass
 
+    classes_to_record = get_classes_to_record(CLASS_KEYWORD, CLASS_START, CLASS_DURATION_MIN)
+    class_names = ", ".join(c["name"] for c in classes_to_record)
+    log(f"Target class(es): {class_names}")
+
     media = MediaStack()
-    recorder = FFmpegRecorder(RECORD_PATH)
     error: str | None = None
-    end_reason = ""
+    all_success = True
 
     try:
         media.start()
@@ -1077,75 +1266,51 @@ async def main() -> int:
             for p in context.pages:
                 _attach_dialog_handler(p)
             page = context.pages[0] if context.pages else await context.new_page()
-            try:
-                await login(page)
-                await open_todays_classes(page)
-                zoom_page = await wait_and_join(context, page)
 
-                zoom_page = await to_web_client(context, zoom_page)
-                await zoom_prejoin(zoom_page)
-                await wait_in_meeting(zoom_page)
-                await join_audio(zoom_page)
-                await dismiss_popups(zoom_page)
+            # Log in once
+            await login(page)
 
-                recorder.start()
-                started = time.monotonic()
-                log("Recording started")
-                await notify("✅ Joined class & started 1080p recording")
-                # Send a screenshot 10s after recording starts so we can verify content
-                await asyncio.sleep(10)
-                await notify_photo(zoom_page, "🎥 Recording in progress — here's what the bot sees")
+            for idx, prof in enumerate(classes_to_record, 1):
+                safe_name = re.sub(r"\W+", "_", prof["name"].lower()).strip("_")
+                if len(classes_to_record) > 1:
+                    out_path = str(Path(RECORD_PATH).parent / f"class_{safe_name}.mp4")
+                else:
+                    out_path = RECORD_PATH
 
-                await go_fullscreen(zoom_page)
-                end_reason = await monitor(zoom_page, started)
-                elapsed_min = (time.monotonic() - started) / 60
-                log(f"Recording ends: {end_reason} (after {elapsed_min:.1f} min)")
-                await notify(f"🛑 Recording ended: {end_reason} (after {elapsed_min:.1f} min)")
-            except asyncio.CancelledError:
-                error = "run was cancelled"
-                raise
-            except Exception as e:
-                error = f"{type(e).__name__}: {e}"
-                log(f"Error: {redact(error)[:300]}")
-                await notify(f"⚠️ Alert: {error}")
-            finally:
-                # ALWAYS finalize FFmpeg so the MP4 is valid and uploadable
-                await asyncio.to_thread(recorder.stop)
+                log(f"[{idx}/{len(classes_to_record)}] Starting processing for {prof['name']} (scheduled start {prof['start']} IST)...")
                 try:
-                    await context.close()
+                    ok = await record_single_class(context, page, prof, out_path)
+                    if not ok and len(classes_to_record) > 1:
+                        log(f"{prof['name']} was skipped; proceeding to next class")
+                except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
+                    log(f"Error during {prof['name']}: {redact(error)[:300]}")
+                    await notify(f"⚠️ Alert ({prof['name']}): {error}")
+                    all_success = False
+
+                # Clean up local file after upload to keep disk free
+                try:
+                    p = Path(out_path)
+                    if p.exists():
+                        p.unlink()
                 except Exception:
                     pass
+
+            try:
+                await context.close()
+            except Exception:
+                pass
     except asyncio.CancelledError:
         error = error or "run was cancelled"
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         log(f"Fatal error: {redact(error)[:300]}")
         await notify(f"⚠️ Alert: {error}")
+        all_success = False
     finally:
         media.stop()
 
-    # Upload whatever was recorded, even after an error
-    out = Path(RECORD_PATH)
-    if out.exists():
-        fsize = out.stat().st_size
-        log(f"Recording file size: {fsize / 1024**2:.1f} MB")
-        if fsize > 1_000_000:
-            try:
-                await upload_to_telegram(str(out))
-            except Exception as e:
-                log(f"Upload failed ({type(e).__name__})")
-                await notify(f"⚠️ Alert: recording finished ({fsize / 1024**2:.1f} MB) but Telegram upload failed ({type(e).__name__})")
-                return 1
-        else:
-            log(f"Recording too small ({fsize} bytes), skipping upload")
-            await notify(f"⚠️ Alert: recording file too small ({fsize / 1024:.0f} KB) — bot may not have been in the meeting")
-            return 1
-    else:
-        if not error:
-            await notify("⚠️ Alert: no recording file was produced")
-        return 1
-
-    return 1 if error else 0
+    return 0 if all_success else 1
 
 
 if __name__ == "__main__":

@@ -2,20 +2,22 @@ name: Record class
 
 on:
   schedule:
-    # 13:47 UTC = 7:17 PM IST (off-peak minute; buffer before 7:30 PM class)
+    # 12:17 UTC = 5:47 PM IST (buffer before 6:00 PM IST Advance Java class)
+    - cron: "17 12 * * *"
+    # 13:47 UTC = 7:17 PM IST (buffer before 7:30 PM IST React JS class)
     - cron: "47 13 * * *"
   workflow_dispatch:
     inputs:
       class_keyword:
-        description: "Class name to look for on the portal"
+        description: "Class to record ('auto', 'Advance Java', 'React JS', or 'all')"
         required: false
-        default: ""
+        default: "auto"
       class_start:
-        description: "Class start time in IST (HH:MM)"
+        description: "Class start time in IST (HH:MM, leave blank for auto/profile default)"
         required: false
         default: ""
       class_duration_min:
-        description: "Recording duration in minutes (default 90)"
+        description: "Recording duration in minutes (leave blank for profile default)"
         required: false
         default: ""
 
@@ -24,7 +26,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: record-class
+  group: record-${{ github.event.schedule || inputs.class_keyword || 'default' }}
   cancel-in-progress: false
 
 jobs:
@@ -49,9 +51,9 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          CLASS_KEYWORD: ${{ inputs.class_keyword || vars.CLASS_KEYWORD || 'React JS' }}
-          CLASS_START: ${{ inputs.class_start || vars.CLASS_START || '19:30' }}
-          CLASS_DURATION_MIN: ${{ inputs.class_duration_min || vars.CLASS_DURATION_MIN || '90' }}
+          CLASS_KEYWORD: ${{ inputs.class_keyword || vars.CLASS_KEYWORD || 'auto' }}
+          CLASS_START: ${{ inputs.class_start || vars.CLASS_START || '' }}
+          CLASS_DURATION_MIN: ${{ inputs.class_duration_min || vars.CLASS_DURATION_MIN || '' }}
         run: |
           mkdir -p out && chmod 777 out
           docker run --rm --init --shm-size=2g \
