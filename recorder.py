@@ -94,7 +94,9 @@ END_RE = re.compile(
     re.I,
 )
 WAITING_ROOM_RE = re.compile(
-    r"(host will let you in|you are in the waiting room|waiting for the host to start)",
+    r"(host will let you in|you are in the waiting room|waiting for the host to start|"
+    r"please wait|waiting room|the meeting host will let you in|"
+    r"wait for the host|host to let you in|waiting to be admitted)",
     re.I,
 )
 POST_MEETING_URL_RE = re.compile(r"(postattendee|/wc/leave|/leave\b|/meeting/end)", re.I)
@@ -781,17 +783,25 @@ async def dismiss_popups(zp) -> None:
 
 
 async def in_meeting(zp) -> bool:
+    """Return True only when we are actually inside the live meeting.
+    The waiting room also has a 'Leave' button, so we must check for
+    elements that ONLY appear in the active meeting view (share-screen,
+    participants panel, chat, reactions, the footer bar, or video tiles)."""
     try:
         await zp.mouse.move(960, 1040)
     except Exception:
         pass
     for frame in zp.frames:
         try:
+            # These selectors only exist inside the active meeting, NOT the waiting room
             loc = frame.locator(
                 "#wc-footer, #foot-bar, [class*='footer-chat'], "
-                "button[aria-label*='Leave' i], button:has-text('Leave'), "
                 "button[aria-label*='Participants' i], button[aria-label*='Chat' i], "
-                "button[aria-label*='Reactions' i], button[aria-label*='Share Screen' i]"
+                "button[aria-label*='Reactions' i], button[aria-label*='Share Screen' i], "
+                "button[aria-label*='Share screen' i], "
+                "[class*='speaker-active-container'], [class*='video-avatar'], "
+                "[class*='meeting-client'], [id*='meeting-client'], "
+                "[class*='participants-section'], [class*='chat-container']"
             ).first
             if await loc.count() and await loc.is_visible():
                 return True
@@ -813,6 +823,7 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
             log("Inside the meeting")
+            await notify_photo(zp, "✅ Confirmed inside the meeting — starting recording soon")
             return
         elapsed = time.monotonic() - started_wait
         if elapsed - last_diag >= 30:
@@ -1081,10 +1092,15 @@ async def main() -> int:
                 started = time.monotonic()
                 log("Recording started")
                 await notify("✅ Joined class & started 1080p recording")
+                # Send a screenshot 10s after recording starts so we can verify content
+                await asyncio.sleep(10)
+                await notify_photo(zoom_page, "🎥 Recording in progress — here's what the bot sees")
 
                 await go_fullscreen(zoom_page)
                 end_reason = await monitor(zoom_page, started)
-                log(f"Recording ends: {end_reason}")
+                elapsed_min = (time.monotonic() - started) / 60
+                log(f"Recording ends: {end_reason} (after {elapsed_min:.1f} min)")
+                await notify(f"🛑 Recording ended: {end_reason} (after {elapsed_min:.1f} min)")
             except asyncio.CancelledError:
                 error = "run was cancelled"
                 raise
@@ -1110,16 +1126,23 @@ async def main() -> int:
 
     # Upload whatever was recorded, even after an error
     out = Path(RECORD_PATH)
-    if out.exists() and out.stat().st_size > 1_000_000:
-        try:
-            await upload_to_telegram(str(out))
-        except Exception as e:
-            log(f"Upload failed ({type(e).__name__})")
-            await notify(f"⚠️ Alert: recording finished but Telegram upload failed ({type(e).__name__})")
+    if out.exists():
+        fsize = out.stat().st_size
+        log(f"Recording file size: {fsize / 1024**2:.1f} MB")
+        if fsize > 1_000_000:
+            try:
+                await upload_to_telegram(str(out))
+            except Exception as e:
+                log(f"Upload failed ({type(e).__name__})")
+                await notify(f"⚠️ Alert: recording finished ({fsize / 1024**2:.1f} MB) but Telegram upload failed ({type(e).__name__})")
+                return 1
+        else:
+            log(f"Recording too small ({fsize} bytes), skipping upload")
+            await notify(f"⚠️ Alert: recording file too small ({fsize / 1024:.0f} KB) — bot may not have been in the meeting")
             return 1
     else:
         if not error:
-            await notify("⚠️ Alert: no recording was produced")
+            await notify("⚠️ Alert: no recording file was produced")
         return 1
 
     return 1 if error else 0
