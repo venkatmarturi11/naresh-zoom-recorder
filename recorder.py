@@ -43,7 +43,10 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+    val = os.environ.get(name)
+    if val is not None and val.strip():
+        return val.strip()
+    return default.strip()
 
 
 PORTAL_URL = _env("PORTAL_URL")
@@ -1120,10 +1123,6 @@ async def main() -> int:
                 "const _assign=location.assign.bind(location),_replace=location.replace.bind(location);"
                 "location.assign=function(u){if(u&&/^zoom(mtg|us)?:/i.test(String(u)))return;_assign(u)};"
                 "location.replace=function(u){if(u&&/^zoom(mtg|us)?:/i.test(String(u)))return;_replace(u)};"
-            )
-            await context.route(
-                re.compile(r"^zoom(mtg|us)?://", re.I),
-                lambda r: r.abort(),
             )
             await context.route(
                 re.compile(r"^zoom(mtg|us)?://", re.I),
