@@ -620,7 +620,10 @@ async def to_web_client(context, zp):
     m = re.search(r"/(j|w)/(\d+)", zp.url)
     if m:
         mid = m.group(2)
-        new_url = f"https://app.zoom.us/wc/{mid}/join"
+        # keep the original host and the ?pwd=... passcode, otherwise Zoom asks for a passcode
+        parts = urllib.parse.urlsplit(zp.url)
+        host = parts.netloc if "zoom." in parts.netloc else "app.zoom.us"
+        new_url = f"https://{host}/wc/{mid}/join" + (f"?{parts.query}" if parts.query else "")
         log(f"Rewriting Zoom link to the web client: {mask_url(new_url)}")
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
