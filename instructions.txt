@@ -1,0 +1,21 @@
+Here is a short note you can save to your phone (e.g., Apple Notes / Google Keep / Telegram Saved Messages):
+
+---
+
+### Naresh Zoom Recorder — Mobile Quick Note
+
+- **Automatic Schedule:** Advance Java (6:00-7:30 PM, cut exactly at 7:30) then React JS (7:30 PM) every day, on GitHub's servers and sends the 1080p recording to **`@Meeting_recorder_bot`** on Telegram (your phone/PC can be off).
+- **Workflow Link:** https://github.com/venkatmarturi11/naresh-zoom-recorder/actions/workflows/record-class.yml
+
+#### 1. Run Manually from Mobile
+1. Open the workflow link above in your mobile browser (or the **GitHub** mobile app → repo **Actions** → **Record class**).
+2. Tap **Run workflow**.
+3. *(Optional)* Enter `class_keyword` (e.g., `React JS`) and `class_start` (`HH:MM` in IST, e.g., `19:30`). Leave blank to use defaults.
+4. Tap the green **Run workflow** button and watch Telegram for updates.
+
+#### 2. Re-enable Schedule After 60 Days of Inactivity
+*(GitHub automatically pauses scheduled workflows if there are no commits for 60 days.)*
+1. Open the workflow link above (or **Actions** → **Record class**).
+2. Look for the yellow banner at the top saying the scheduled workflow was disabled, and tap **Enable workflow** (one tap).
+
+---

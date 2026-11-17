@@ -3,7 +3,11 @@
 Records your daily live class from the student portal on GitHub's free servers
 (no device of your own needed) and sends the 1080p MP4 to your Telegram.
 
-How it works: GitHub Actions starts a container at 7:20 PM IST, logs in to the
+Daily schedule (IST): **Advance Java 6:00-7:30 PM** first (recording is cut at
+exactly 7:30 PM), then **React JS 7:30 PM** (90 min). Each class is its own run
+(5:47 PM and 7:17 PM triggers) and sends its own video to Telegram.
+
+How it works: GitHub Actions starts a container shortly before class, logs in to the
 portal, waits for the **Join** button to become active, joins the Zoom web
 client with mic and camera off, records the screen and audio with FFmpeg, then
 uploads the video to Telegram (files over ~1.95 GB are split automatically).
@@ -16,7 +20,7 @@ uploads the video to Telegram (files over ~1.95 GB are split automatically).
 ├── .env.example
 └── .github/workflows/
     ├── build-image.yml     # builds the image once into ghcr.io
-    └── record-class.yml    # daily 7:20 PM IST + manual run
+    └── record-class.yml    # Java 5:47 PM + React 7:17 PM triggers + manual run
 ```
 
 ## One-time setup
@@ -41,6 +45,16 @@ uploads the video to Telegram (files over ~1.95 GB are split automatically).
    `CLASS_START` (default `19:30`, IST, 24-hour).
 4. **Settings -> Actions -> General -> Workflow permissions**: allow
    *Read and write permissions* (needed to publish the image).
+
+### Turning on the Advance Java class
+The Java run is skipped until you switch it on, so there are no false alerts
+before the class exists. Under **Settings -> Secrets and variables -> Actions ->
+Variables** add either:
+- `JAVA_START_DATE` = first class day, e.g. `2026-11-24` (turns on by itself), or
+- `JAVA_ENABLED` = `true`.
+
+Optional variables: `JAVA_KEYWORD` (default `Advance Java|Advanced Java`,
+`|` separates alternatives), `JAVA_START` (`18:00`), `JAVA_END` (`19:30`).
 
 ### 3. Build the image
 Pushing to `main` runs **Build recorder image** automatically. Wait for the
