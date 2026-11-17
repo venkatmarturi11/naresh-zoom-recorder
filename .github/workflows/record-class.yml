@@ -121,6 +121,8 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ZOOM_EMAIL: ${{ secrets.ZOOM_EMAIL }}
+          ZOOM_PASS: ${{ secrets.ZOOM_PASS }}
           CLASS_KEYWORD: ${{ steps.plan.outputs.keyword }}
           CLASS_START: ${{ steps.plan.outputs.start }}
           CLASS_END: ${{ steps.plan.outputs.end }}
@@ -132,5 +134,6 @@ jobs:
             -e RECORD_PATH=/out/class_recording.mp4 \
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
+            -e ZOOM_EMAIL -e ZOOM_PASS \
             -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
