@@ -61,9 +61,21 @@ TG_CHAT_ID = _env("TG_CHAT_ID")
 
 CLASS_KEYWORD = _env("CLASS_KEYWORD", "React JS")
 CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
+CLASS_END = _env("CLASS_END", "")  # HH:MM, IST (optional hard stop)
 CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "90"))
 MAX_WAIT_MIN = int(_env("MAX_WAIT_MIN", "45"))  # wait for Join to activate
 MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", str(CLASS_DURATION_MIN * 60)))
+if CLASS_END and not os.environ.get("MAX_MEETING_SEC", "").strip():
+    try:
+        sh, sm = (int(x) for x in CLASS_START.split(":"))
+        eh, em = (int(x) for x in CLASS_END.split(":"))
+        diff_sec = ((eh * 60 + em) - (sh * 60 + sm)) * 60
+        if diff_sec < 0:
+            diff_sec += 24 * 3600
+        if diff_sec > 0:
+            MAX_MEETING_SEC = diff_sec + 600  # 10 min buffer past class end
+    except Exception:
+        pass
 PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (
     PORTAL_USER.split("@")[0] if "@" in PORTAL_USER else "Student"
 )

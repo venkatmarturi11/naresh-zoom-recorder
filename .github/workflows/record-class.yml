@@ -14,13 +14,21 @@ on:
         description: "Class start time in IST (HH:MM)"
         required: false
         default: ""
+      class_end:
+        description: "Class end time in IST (HH:MM) - hard stop"
+        required: false
+        default: ""
+      class_duration_min:
+        description: "Class duration in minutes"
+        required: false
+        default: ""
 
 permissions:
   contents: read
   packages: read
 
 concurrency:
-  group: record-class
+  group: record-${{ inputs.class_keyword || vars.CLASS_KEYWORD || 'default' }}
   cancel-in-progress: false
 
 jobs:
@@ -47,6 +55,8 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CLASS_KEYWORD: ${{ inputs.class_keyword || vars.CLASS_KEYWORD || 'React JS' }}
           CLASS_START: ${{ inputs.class_start || vars.CLASS_START || '19:30' }}
+          CLASS_END: ${{ inputs.class_end || vars.CLASS_END }}
+          CLASS_DURATION_MIN: ${{ inputs.class_duration_min || vars.CLASS_DURATION_MIN || '90' }}
           USER_SELECTOR: ${{ vars.USER_SELECTOR || secrets.USER_SELECTOR }}
           PASS_SELECTOR: ${{ vars.PASS_SELECTOR || secrets.PASS_SELECTOR }}
           PARTICIPANT_NAME: ${{ vars.PARTICIPANT_NAME }}
@@ -61,7 +71,7 @@ jobs:
             -e RECORD_PATH=/out/class_recording.mp4 \
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
-            -e CLASS_KEYWORD -e CLASS_START \
+            -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
             -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME \
             -e MAX_WAIT_MIN -e MAX_MEETING_SEC -e ALLOWED_HOSTS -e BLOCK_TRACKERS \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"

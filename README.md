@@ -53,6 +53,15 @@ its package visibility as is; the daily workflow logs in with the built-in token
 `class_start` to a class that is live right now (or starting within 45 minutes).
 Watch the Telegram alerts and the run log. Fix any selector problems (see below).
 
+## 24/7 Cloud Scheduler Web App (Optional, Recommended)
+A dedicated Cloudflare Worker scheduler is deployed for this repo at:
+👉 **[https://class-scheduler.class-scheduler.workers.dev/](https://class-scheduler.class-scheduler.workers.dev/)**
+
+- **Exact IST Minute Scheduling:** Cloudflare triggers the GitHub Actions API at the exact IST minute, avoiding GitHub's cron jitter.
+- **Bypasses 60-Day Inactivity Pause:** Runs 24/7 on Cloudflare's edge without needing manual re-activation.
+- **Multi-Class Support:** Set schedules for both **Advance Java** (`18:00` - `19:30`) and **React JS** (`19:30` onwards).
+- **One-Tap Mobile Control:** Open from your phone, sign in with GitHub, toggle schedules, or tap **▶️ Test Run Now**.
+
 ## Popup protection (Chrome + Zoom)
 - **Extra tabs/windows**: any tab that is not the portal or Zoom is closed within 1 s;
   once Zoom opens, it is the only tab allowed (and is brought to front).
