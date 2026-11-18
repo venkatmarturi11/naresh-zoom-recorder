@@ -81,6 +81,7 @@ PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (
 )
 
 RECORD_PATH = _env("RECORD_PATH", "/tmp/class_recording.mp4")
+STEP_SUMMARY_PATH = _env("STEP_SUMMARY_PATH", "")
 FFMPEG_LOG = "/tmp/ffmpeg.log"
 DISPLAY = ":99"
 SINK = "VirtualSpeaker"
@@ -168,6 +169,48 @@ CHROMIUM_ARGS = [
 # --------------------------------------------------------------------------
 def log(msg: str) -> None:
     print(f"[{datetime.now(IST).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+class StepTracker:
+    """Logs milestones with timestamps and outputs GitHub Step Summary markdown."""
+
+    def __init__(self, path: str = ""):
+        self.path = path
+        self._init_summary()
+
+    def _init_summary(self):
+        if not self.path:
+            return
+        header = (
+            f"## 🎥 Zoom Class Recording Summary\n\n"
+            f"- **Class Keyword:** `{CLASS_KEYWORD}`\n"
+            f"- **Class Time:** `{CLASS_START} IST`" + (f" - `{CLASS_END} IST`" if CLASS_END else "") + "\n"
+            f"- **Date:** `{datetime.now(IST).strftime('%Y-%m-%d')}`\n\n"
+            f"| Step | Status | Time (IST) | Details |\n"
+            f"| :--- | :---: | :---: | :--- |\n"
+        )
+        try:
+            p = Path(self.path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(header, encoding="utf-8")
+        except Exception:
+            pass
+
+    def record(self, step_name: str, status: str = "✅", details: str = "") -> None:
+        now_str = datetime.now(IST).strftime("%H:%M:%S")
+        log(f"{status} [{step_name}] {details}".strip())
+        if not self.path:
+            return
+        safe_details = details.replace("|", "/")
+        row = f"| {step_name} | {status} | {now_str} | {safe_details} |\n"
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(row)
+        except Exception:
+            pass
+
+
+step = StepTracker(STEP_SUMMARY_PATH)
 
 
 def redact(text: str) -> str:
@@ -545,14 +588,16 @@ async def _tab_closer(context, portal_url: str, allowed_extra: list[str], zoom_a
 # State 2: portal login + navigation
 # --------------------------------------------------------------------------
 async def login(page) -> None:
+    step.record("Portal Login", "🌐", f"Opening portal: {mask_url(PORTAL_URL)}")
     await page.goto(PORTAL_URL, wait_until="domcontentloaded")
     try:
         pw_field = page.locator(PASS_SEL).first
         await pw_field.wait_for(state="visible", timeout=15000)
     except PWTimeout:
-        log("No login form found; assuming an existing session")
+        step.record("Portal Login", "ℹ️", "No password field visible; session already active")
         return
 
+    step.record("Portal Login", "🔑", f"Entering credentials for user: {PORTAL_USER[:3]}***")
     user_field = page.locator(USER_SEL).first
     await user_field.fill(PORTAL_USER)
     await pw_field.fill(PORTAL_PASS)
@@ -569,13 +614,15 @@ async def login(page) -> None:
     try:
         await page.locator(PASS_SEL).first.wait_for(state="hidden", timeout=20000)
     except PWTimeout:
+        step.record("Portal Login", "❌", "Login failed (password field still visible)")
         raise RuntimeError("Portal login appears to have failed (password field still visible)")
-    log("Logged in to portal")
+    step.record("Portal Login", "✅", "Login success! Portal session authenticated")
     await dismiss_popups(page)
 
 
 async def open_todays_classes(page) -> None:
     await dismiss_popups(page)
+    step.record("Live Classes", "📋", "Navigating to Live Classes / Today's Classes tab")
     try:
         await page.get_by_text(re.compile(r"Live\s*Classes", re.I)).first.click(timeout=8000)
     except Exception:
@@ -587,6 +634,7 @@ async def open_todays_classes(page) -> None:
     await page.wait_for_load_state("domcontentloaded")
     await asyncio.sleep(1.0)
     await dismiss_popups(page)
+    step.record("Live Classes", "✅", "Live Classes tab loaded successfully")
 
 
 async def join_ready(btn) -> bool:
@@ -653,29 +701,32 @@ async def wait_and_join(context, page):
     reload_until = start_dt - timedelta(seconds=15)
     deadline = time.monotonic() + MAX_WAIT_MIN * 60
     last_reload = time.monotonic()
+    last_wait_log = 0.0
     reloaded_at_start = False
     early_click_failed = False
-    log(f"Waiting for the Join button (class start {CLASS_START} IST)")
+    step.record("Waiting for Join", "⏳", f"Searching for '{CLASS_KEYWORD}' card (class starts {CLASS_START} IST)")
 
     while time.monotonic() < deadline:
         now = datetime.now(IST)
         card, btn = await find_active_join(page)
         found = card is not None and btn is not None
 
-        if found and (now >= start_dt or not early_click_failed):
-            if await join_ready(btn):
-                log("Join button is active; clicking")
+        if found:
+            is_active = await join_ready(btn)
+            if is_active and (now >= start_dt or not early_click_failed):
+                step.record("Join Button", "🎯", f"Join button is active and clickable! Clicking Join for '{CLASS_KEYWORD}'")
                 prev_url = page.url
                 zp = await click_join(
                     context, page, btn, wait_sec=25 if now >= start_dt else 12
                 )
                 if zp is not None:
+                    step.record("Join Button", "✅", "Clicked Join button; Zoom window opened successfully")
                     return zp
                 if now < start_dt:
                     early_click_failed = True
-                    log(f"Join did not open Zoom yet; waiting until {CLASS_START} IST")
+                    step.record("Join Button", "⏳", f"Join click did not open Zoom yet; waiting until {CLASS_START} IST")
                 else:
-                    log("Join click did not open Zoom yet; retrying after reload")
+                    step.record("Join Button", "🔄", "Join click did not open Zoom yet; retrying after reload")
                 try:
                     if page.url != prev_url:
                         await page.goto(prev_url, wait_until="domcontentloaded")
@@ -687,6 +738,16 @@ async def wait_and_join(context, page):
                 last_reload = time.monotonic()
                 await asyncio.sleep(3)
                 continue
+            else:
+                if time.monotonic() - last_wait_log >= 30:
+                    last_wait_log = time.monotonic()
+                    time_diff = int((start_dt - now).total_seconds())
+                    wait_status = f"{time_diff}s until start" if time_diff > 0 else "class time reached; waiting for host to activate Join button"
+                    step.record("Waiting for Join", "⏳", f"Found '{CLASS_KEYWORD}' card. Waiting for Join button to become clickable ({wait_status})...")
+        else:
+            if time.monotonic() - last_wait_log >= 30:
+                last_wait_log = time.monotonic()
+                step.record("Waiting for Join", "🔍", f"Waiting for '{CLASS_KEYWORD}' card to appear on portal...")
 
         since_reload = time.monotonic() - last_reload
         need_reload = False
@@ -695,6 +756,7 @@ async def wait_and_join(context, page):
         elif now >= start_dt and not reloaded_at_start:
             need_reload = True  # one refresh exactly at the start time
             reloaded_at_start = True
+            step.record("Waiting for Join", "🔄", f"Reached {CLASS_START} IST; refreshing portal to check for active button")
         elif now >= start_dt and since_reload >= 30:
             need_reload = True  # safety net if the button is still inactive
         elif not found and since_reload >= 10:
@@ -710,6 +772,7 @@ async def wait_and_join(context, page):
 
         await asyncio.sleep(1.5 if now < reload_until else 1.0)
 
+    step.record("Waiting for Join", "❌", f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} mins")
     raise TimeoutError(
         f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} minutes"
     )
@@ -769,6 +832,7 @@ async def _has_webclient(context, zp):
 
 
 async def to_web_client(context, zp):
+    step.record("Zoom Client", "💻", "Navigating to Zoom in-browser Web Client")
     found = await _has_webclient(context, zp)
     if found:
         log(f"Web client active: {mask_url(found.url)}")
@@ -861,6 +925,7 @@ async def click_prejoin_join(zp) -> bool:
 async def zoom_prejoin(zp) -> None:
     deadline = time.monotonic() + 60
     clicked_join = False
+    step.record("Zoom Pre-Join", "⚙️", "Handling pre-join prompts (name entry, mic mute verification)")
     while time.monotonic() < deadline:
         if await in_meeting(zp):
             clicked_join = True
@@ -880,13 +945,14 @@ async def zoom_prejoin(zp) -> None:
                     val = await name_in.input_value()
                     if not val.strip():
                         await name_in.fill(PARTICIPANT_NAME)
-                        log(f"Filled participant name: {PARTICIPANT_NAME}")
+                        step.record("Participant Name", "👤", f"Filled student display name: {PARTICIPANT_NAME}")
                         await name_in.press("Enter")
             except Exception:
                 continue
 
         if await click_prejoin_join(zp):
             clicked_join = True
+            step.record("Zoom Pre-Join", "🚀", "Clicked Zoom pre-join 'Join' button")
             await asyncio.sleep(2)
             if await in_meeting(zp):
                 break
@@ -965,7 +1031,7 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
             raise RuntimeError("Meeting ended before the recording could start")
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
-            log("Inside the meeting")
+            step.record("Meeting Status", "🎥", "Confirmed inside Zoom meeting! Ready to record")
             return
         elapsed = time.monotonic() - started_wait
         if elapsed - last_diag >= 30:
@@ -979,11 +1045,12 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if elapsed >= 4 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 5 < 2:
             await click_prejoin_join(zp)
         await asyncio.sleep(2)
-    log("Could not confirm meeting UI; starting the recording anyway")
+    step.record("Meeting Status", "⚠️", "Could not confirm meeting UI; starting recording anyway")
 
 
 async def join_audio(zp) -> None:
     """Listen-only: join computer audio so we can hear, keep the mic muted."""
+    step.record("Zoom Audio", "🔊", "Connecting to computer audio (listen-only, mic muted)")
     for _ in range(8):
         if await click_any(
             zp,
@@ -1026,8 +1093,10 @@ async def go_fullscreen(zp) -> None:
 async def monitor(zp, started: float) -> str:
     failures = 0
     last_housekeeping = 0.0
+    last_progress_log = time.monotonic()
     while True:
-        if time.monotonic() - started >= MAX_MEETING_SEC:
+        elapsed = time.monotonic() - started
+        if elapsed >= MAX_MEETING_SEC:
             return "maximum duration reached"
         if zp.is_closed():
             return "Zoom tab closed"
@@ -1043,6 +1112,11 @@ async def monitor(zp, started: float) -> str:
             failures += 1
             if failures > 20:
                 return "page became unreachable"
+
+        if time.monotonic() - last_progress_log >= 300:
+            last_progress_log = time.monotonic()
+            mins_elapsed = int(elapsed / 60)
+            step.record("Recording Active", "⏺️", f"Recording in progress: {mins_elapsed} mins elapsed | Host streaming")
 
         if time.monotonic() - last_housekeeping > 10:
             last_housekeeping = time.monotonic()
@@ -1141,7 +1215,7 @@ async def upload_to_telegram(path: str) -> None:
     parts = [path] if size <= TG_SIZE_LIMIT else await asyncio.to_thread(split_file, path)
     total = len(parts)
     base_caption = f"🎥 {CLASS_KEYWORD} | {datetime.now(IST).strftime('%Y-%m-%d')}"
-    log(f"Uploading {total} file(s), {size / 1024**3:.2f} GB total")
+    step.record("Telegram Upload", "📤", f"Uploading {total} part(s) ({size / 1024**3:.2f} GB total) to @Meeting_recorder_bot")
 
     async with Client(
         "recorder", api_id=int(TG_API_ID), api_hash=TG_API_HASH,
@@ -1158,7 +1232,7 @@ async def upload_to_telegram(path: str) -> None:
                         supports_streaming=True, width=1920, height=1080,
                         duration=duration, thumb=thumb,
                     )
-                    log(f"Uploaded part {idx}/{total}")
+                    step.record("Telegram Upload", "✅", f"Part {idx}/{total} uploaded successfully")
                     break
                 except FloodWait as fw:
                     await asyncio.sleep(int(fw.value) + 1)
@@ -1194,6 +1268,7 @@ async def main() -> int:
 
     try:
         media.start()
+        step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
 
         prof_dir = Path("/tmp/pw-profile")
@@ -1293,23 +1368,26 @@ async def main() -> int:
 
                 recorder.start()
                 started = time.monotonic()
-                log("Recording started")
+                step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{CLASS_KEYWORD}'")
                 await notify("✅ Joined class & started 1080p recording")
 
                 await go_fullscreen(zoom_page)
                 end_reason = await monitor(zoom_page, started)
+                step.record("Meeting Concluded", "🏁", f"Meeting finished: {end_reason}")
                 log(f"Recording ends: {end_reason}")
             except asyncio.CancelledError:
                 error = "run was cancelled"
                 raise
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
+                step.record("Run Error", "❌", f"Error: {redact(error)[:100]}")
                 log(f"Error: {redact(error)[:300]}")
                 await notify(f"⚠️ Alert: {error}")
             finally:
                 if tab_closer_task:
                     tab_closer_task.cancel()
                 # ALWAYS finalize FFmpeg so the recording is valid and uploadable
+                step.record("Video Processing", "🔄", "Stopping FFmpeg & concatenating/remuxing segments to MP4 (+faststart)")
                 await asyncio.to_thread(recorder.stop)
                 try:
                     await context.close()
@@ -1327,15 +1405,22 @@ async def main() -> int:
     # Upload whatever was recorded, even after an error
     out = Path(RECORD_PATH)
     if out.exists() and out.stat().st_size > 1_000_000:
+        dur = probe_duration(str(out))
+        size_mb = out.stat().st_size / (1024 * 1024)
+        dur_str = f"{int(dur // 60)}m {int(dur % 60)}s"
+        step.record("Video Processing", "✅", f"Faststart MP4 ready: {size_mb:.1f} MB (Duration: {dur_str})")
         try:
             await upload_to_telegram(str(out))
         except Exception as e:
+            step.record("Telegram Upload", "❌", f"Upload failed ({type(e).__name__})")
             log(f"Upload failed ({type(e).__name__})")
             await notify(f"⚠️ Alert: recording finished but Telegram upload failed ({type(e).__name__})")
             return 1
+        step.record("Telegram Upload", "✅", "Uploaded recording to Telegram successfully!")
         await notify("✅ Uploaded recording to Telegram")
     else:
         if not error:
+            step.record("Recording Result", "⚠️", "No valid recording was produced (>1MB)")
             await notify("⚠️ Alert: no recording was produced")
         return 1
 

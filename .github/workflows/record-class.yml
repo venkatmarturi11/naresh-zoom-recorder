@@ -66,12 +66,21 @@ jobs:
           BLOCK_TRACKERS: ${{ vars.BLOCK_TRACKERS }}
         run: |
           mkdir -p out && chmod 777 out
+          touch out/step_summary.md && chmod 666 out/step_summary.md
           docker run --rm --init --shm-size=2g \
             -v "$PWD/out:/out" \
             -e RECORD_PATH=/out/class_recording.mp4 \
+            -e STEP_SUMMARY_PATH=/out/step_summary.md \
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
             -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
             -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME \
             -e MAX_WAIT_MIN -e MAX_MEETING_SEC -e ALLOWED_HOSTS -e BLOCK_TRACKERS \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
+
+      - name: Publish Step Summary to GitHub Page
+        if: always()
+        run: |
+          if [ -f out/step_summary.md ]; then
+            cat out/step_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
