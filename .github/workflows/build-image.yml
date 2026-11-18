@@ -9,6 +9,7 @@ on:
       - Dockerfile
       - requirements.txt
       - recorder.py
+      - popup_guard.js
       - .github/workflows/build-image.yml
   workflow_dispatch:
 

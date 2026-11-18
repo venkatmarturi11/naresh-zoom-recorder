@@ -1,33 +1,17 @@
 name: Record class
 
-# Two classes every day, in this order (all times IST):
-#   1. Advance Java  18:00 -> 19:30  (recording is cut at exactly 19:30)
-#   2. React JS      19:30 -> ~21:00
-#
-# Each class gets its own run. The runs are independent (separate runners),
-# so the Java upload never delays the start of the React class.
 on:
   schedule:
-    # 12:17 UTC = 5:47 PM IST  -> Advance Java (class starts 6:00 PM)
-    - cron: "17 12 * * *"
-    # 13:47 UTC = 7:17 PM IST  -> React JS (class starts 7:30 PM)
-    - cron: "47 13 * * *"
+    # 13:52 UTC = 7:22 PM IST (8 minutes before the 7:30 PM class)
+    - cron: "52 13 * * *"
   workflow_dispatch:
     inputs:
       class_keyword:
-        description: "Class name on the portal (a|b = alternatives). Blank = pick by time of day"
+        description: "Class name to look for on the portal"
         required: false
         default: ""
       class_start:
         description: "Class start time in IST (HH:MM)"
-        required: false
-        default: ""
-      class_end:
-        description: "Hard stop time in IST (HH:MM). Blank = use duration"
-        required: false
-        default: ""
-      class_duration_min:
-        description: "Recording duration in minutes (used when no end time)"
         required: false
         default: ""
 
@@ -35,9 +19,8 @@ permissions:
   contents: read
   packages: read
 
-# One run per class at a time (a re-run of the same class queues, the other class is not blocked)
 concurrency:
-  group: record-${{ github.event.schedule || github.run_id }}
+  group: record-class
   cancel-in-progress: false
 
 jobs:
@@ -45,74 +28,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - name: Decide which class this run is for
-        id: plan
-        env:
-          SCHEDULE: ${{ github.event.schedule }}
-          IN_KEYWORD: ${{ inputs.class_keyword }}
-          IN_START: ${{ inputs.class_start }}
-          IN_END: ${{ inputs.class_end }}
-          IN_DURATION: ${{ inputs.class_duration_min }}
-          # Advance Java is switched on from JAVA_START_DATE (YYYY-MM-DD) or JAVA_ENABLED=true
-          JAVA_ENABLED: ${{ vars.JAVA_ENABLED }}
-          JAVA_START_DATE: ${{ vars.JAVA_START_DATE }}
-          JAVA_KEYWORD: ${{ vars.JAVA_KEYWORD || 'Advance Java|Advanced Java' }}
-          JAVA_START: ${{ vars.JAVA_START || '18:00' }}
-          JAVA_END: ${{ vars.JAVA_END || '19:30' }}
-          REACT_KEYWORD: ${{ vars.CLASS_KEYWORD || 'React JS' }}
-          REACT_START: ${{ vars.CLASS_START || '19:30' }}
-          REACT_DURATION: ${{ vars.CLASS_DURATION_MIN || '90' }}
-        run: |
-          set -eu
-          today=$(TZ=Asia/Kolkata date +%F)
-          hhmm=$(TZ=Asia/Kolkata date +%H%M)
-
-          # Which class? schedule decides; manual runs decide by time of day (before 19:00 IST = Java)
-          if [ "$SCHEDULE" = "17 12 * * *" ]; then which=java
-          elif [ -n "$SCHEDULE" ]; then which=react
-          elif [ -n "$IN_KEYWORD" ]; then which=custom
-          elif [ "$hhmm" -lt 1900 ]; then which=java
-          else which=react; fi
-
-          run=true
-          if [ "$which" = custom ]; then
-            kw="$IN_KEYWORD"; start="${IN_START:-19:30}"; end="$IN_END"; dur="${IN_DURATION:-90}"
-          elif [ "$which" = java ]; then
-            kw="$JAVA_KEYWORD"; start="${IN_START:-$JAVA_START}"; end="${IN_END:-$JAVA_END}"; dur=150
-            enabled=false
-            [ "$JAVA_ENABLED" = "true" ] && enabled=true
-            if [ -n "$JAVA_START_DATE" ] && [ ! "$today" \< "$JAVA_START_DATE" ]; then enabled=true; fi
-            # manual run of the Java class always goes ahead
-            [ -z "$SCHEDULE" ] && enabled=true
-            if [ "$enabled" != true ]; then
-              run=false
-              echo "Advance Java is not enabled yet (set repo variable JAVA_START_DATE or JAVA_ENABLED=true). Skipping."
-            fi
-          else
-            kw="${IN_KEYWORD:-$REACT_KEYWORD}"; start="${IN_START:-$REACT_START}"; end="$IN_END"; dur="${IN_DURATION:-$REACT_DURATION}"
-          fi
-
-          echo "class=$which keyword=$kw start=$start end=${end:-none} duration=$dur run=$run"
-          {
-            echo "run=$run"
-            echo "keyword=$kw"
-            echo "start=$start"
-            echo "end=$end"
-            echo "duration=$dur"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Log in to ghcr.io
-        if: steps.plan.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Pull pre-built image
-        if: steps.plan.outputs.run == 'true'
         run: docker pull -q "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
 
       - name: Record class and upload to Telegram
-        if: steps.plan.outputs.run == 'true'
         env:
           PORTAL_URL: ${{ secrets.PORTAL_URL }}
           PORTAL_USER: ${{ secrets.PORTAL_USER }}
@@ -121,12 +45,15 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ZOOM_EMAIL: ${{ secrets.ZOOM_EMAIL }}
-          ZOOM_PASS: ${{ secrets.ZOOM_PASS }}
-          CLASS_KEYWORD: ${{ steps.plan.outputs.keyword }}
-          CLASS_START: ${{ steps.plan.outputs.start }}
-          CLASS_END: ${{ steps.plan.outputs.end }}
-          CLASS_DURATION_MIN: ${{ steps.plan.outputs.duration }}
+          CLASS_KEYWORD: ${{ inputs.class_keyword || vars.CLASS_KEYWORD || 'React JS' }}
+          CLASS_START: ${{ inputs.class_start || vars.CLASS_START || '19:30' }}
+          USER_SELECTOR: ${{ vars.USER_SELECTOR || secrets.USER_SELECTOR }}
+          PASS_SELECTOR: ${{ vars.PASS_SELECTOR || secrets.PASS_SELECTOR }}
+          PARTICIPANT_NAME: ${{ vars.PARTICIPANT_NAME }}
+          MAX_WAIT_MIN: ${{ vars.MAX_WAIT_MIN }}
+          MAX_MEETING_SEC: ${{ vars.MAX_MEETING_SEC }}
+          ALLOWED_HOSTS: ${{ vars.ALLOWED_HOSTS }}
+          BLOCK_TRACKERS: ${{ vars.BLOCK_TRACKERS }}
         run: |
           mkdir -p out && chmod 777 out
           docker run --rm --init --shm-size=2g \
@@ -134,6 +61,7 @@ jobs:
             -e RECORD_PATH=/out/class_recording.mp4 \
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
-            -e ZOOM_EMAIL -e ZOOM_PASS \
-            -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
+            -e CLASS_KEYWORD -e CLASS_START \
+            -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME \
+            -e MAX_WAIT_MIN -e MAX_MEETING_SEC -e ALLOWED_HOSTS -e BLOCK_TRACKERS \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"

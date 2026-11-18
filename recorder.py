@@ -4,7 +4,7 @@ Autonomous zero-device 1080p Zoom class recorder + Telegram archiver.
 
 Pipeline:  Xvfb + PulseAudio -> Chromium (Playwright) -> portal login ->
            poll Join button -> Zoom web client (muted, no camera) ->
-           FFmpeg x11grab/pulse recording -> crash-safe finalize ->
+           FFmpeg x11grab/pulse crash-safe MKV segments -> MP4 remux ->
            Pyrogram MTProto upload (auto-split above ~1.95 GB).
 
 All configuration comes from environment variables (GitHub Secrets).
@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -43,10 +44,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 def _env(name: str, default: str = "") -> str:
-    val = os.environ.get(name)
-    if val is not None and val.strip():
-        return val.strip()
-    return default.strip()
+    """Return env var *name*, falling back to *default* when unset OR blank."""
+    val = os.environ.get(name, "").strip()
+    return val if val else default.strip()
 
 
 PORTAL_URL = _env("PORTAL_URL")
@@ -61,17 +61,9 @@ TG_CHAT_ID = _env("TG_CHAT_ID")
 
 CLASS_KEYWORD = _env("CLASS_KEYWORD", "React JS")
 CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
-CLASS_END = _env("CLASS_END")  # optional HH:MM IST: hard stop of the recording
 CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "90"))
 MAX_WAIT_MIN = int(_env("MAX_WAIT_MIN", "45"))  # wait for Join to activate
-# With CLASS_END the wall-clock end time decides; the duration is only a safety net.
-MAX_MEETING_SEC = int(
-    _env("MAX_MEETING_SEC", str(4 * 3600 if CLASS_END else CLASS_DURATION_MIN * 60))
-)
-# CLASS_KEYWORD may list alternatives separated by "|" (e.g. "Advance Java|Advanced Java")
-KEYWORDS = [k.strip() for k in CLASS_KEYWORD.split("|") if k.strip()] or [CLASS_KEYWORD]
-KEYWORD_RE = re.compile("|".join(re.escape(k) for k in KEYWORDS), re.I)
-CLASS_LABEL = KEYWORDS[0]
+MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", str(CLASS_DURATION_MIN * 60)))
 PARTICIPANT_NAME = _env("PARTICIPANT_NAME", "") or (
     PORTAL_USER.split("@")[0] if "@" in PORTAL_USER else "Student"
 )
@@ -92,6 +84,30 @@ USER_SEL = _env(
 )
 PASS_SEL = _env("PASS_SELECTOR", 'input[type="password"]')
 
+# Popup / tab guard configuration
+_ALLOWED_RAW = _env("ALLOWED_HOSTS", "")
+ALLOWED_HOSTS = [h.strip() for h in _ALLOWED_RAW.split(",") if h.strip()]
+BLOCK_TRACKERS = _env("BLOCK_TRACKERS", "1") != "0"
+
+TRACKER_DOMAINS = [
+    "google-analytics.com", "analytics.google.com", "googletagmanager.com",
+    "doubleclick.net", "stats.g.doubleclick.net", "cm.g.doubleclick.net",
+    "googlesyndication.com", "pagead2.googlesyndication.com",
+    "googleadservices.com", "adservice.google.com",
+    "hotjar.com", "hotjar.io", "static.hotjar.com",
+    "facebook.net", "connect.facebook.net",
+    "sentry.io", "amplitude.com", "mixpanel.com",
+    "segment.io", "segment.com", "cdn.segment.com",
+    "optimizely.com", "crazyegg.com", "mouseflow.com",
+    "fullstory.com", "clarity.ms", "newrelic.com", "nr-data.net",
+    "intercom.io", "intercomcdn.com",
+]
+
+TRACKER_RE = re.compile(
+    r"^https?://(?:[^/]+\.)?(?:" + "|".join(re.escape(d) for d in TRACKER_DOMAINS) + r")(?:[:/?#]|$)",
+    re.I,
+)
+
 TG_SIZE_LIMIT = int(1.95 * 1024**3)  # single-file ceiling for MTProto upload
 
 REQUIRED = [
@@ -105,29 +121,16 @@ END_RE = re.compile(
     re.I,
 )
 WAITING_ROOM_RE = re.compile(
-    r"(host will let you in|you are in the waiting room|waiting for the host to start|"
-    r"please wait|waiting room|the meeting host will let you in|"
-    r"wait for the host|host to let you in|waiting to be admitted)",
+    r"(host will let you in|you are in the waiting room|waiting for the host to start)",
     re.I,
 )
-SIGNIN_URL_RE = re.compile(r"(/signin|/google_oauth|accounts\.google|facebook\.com|appleid\.apple|login\.microsoftonline|/saml|/sso|/meeting/register)", re.I)
-SIGNIN_TEXT_RE = re.compile(
-    r"(sign in to (join|continue)|sign in with (apple|google|facebook|sso|microsoft)|"
-    r"authorized attendees|only authenticated users|authenticated users can join|"
-    r"sign in to zoom|forgot password|sign in with sso)",
-    re.I,
-)
-ZOOM_EMAIL = _env("ZOOM_EMAIL")
-ZOOM_PASS = _env("ZOOM_PASS")
 POST_MEETING_URL_RE = re.compile(r"(postattendee|/wc/leave|/leave\b|/meeting/end)", re.I)
 
 HIDE_CSS = """
 * { cursor: none !important; }
 #wc-footer, #foot-bar, .footer-bar, .footer__inner, .meeting-info-container,
 .zm-notification, [class*='toast'], [class*='Toast'], [class*='notification'],
-[class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'],
-.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*='backdrop'],
-.recording-disclaimer, [class*='record-disclaimer'], [class*='recording-tip'] {
+[class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'] {
   display: none !important; visibility: hidden !important; opacity: 0 !important;
 }
 """
@@ -145,8 +148,6 @@ CHROMIUM_ARGS = [
     "--autoplay-policy=no-user-gesture-required",
     "--no-first-run",
     "--disable-features=Translate",
-    # Suppress "Open xdg-open?" external protocol dialog
-    "--disable-external-intent-requests",
 ]
 
 
@@ -159,7 +160,7 @@ def log(msg: str) -> None:
 
 def redact(text: str) -> str:
     """Strip secrets from anything that might be logged or sent to Telegram."""
-    for secret in (PORTAL_PASS, ZOOM_PASS, TG_BOT_TOKEN, TG_API_HASH):
+    for secret in (PORTAL_PASS, TG_BOT_TOKEN, TG_API_HASH):
         if secret:
             text = text.replace(secret, "***")
     return text
@@ -178,11 +179,28 @@ def class_start_dt() -> datetime:
     return datetime.now(IST).replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
-def class_end_dt() -> datetime | None:
-    if not CLASS_END:
-        return None
-    hh, mm = (int(x) for x in CLASS_END.split(":"))
-    return datetime.now(IST).replace(hour=hh, minute=mm, second=0, microsecond=0)
+def _domain_base(host: str) -> str:
+    parts = host.split(".")
+    if len(parts) > 2 and parts[-2] in ("edu", "ac", "co", "gov", "org", "res", "net", "com"):
+        return ".".join(parts[-3:])
+    elif len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def _host_matches(host: str, pattern: str) -> bool:
+    """True when *host* equals *pattern* or is a subdomain of it."""
+    if not pattern:
+        return False
+    return host == pattern or host.endswith("." + pattern)
+
+
+def _is_zoom_host(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+        return bool(re.search(r"(^|\.)zoom(gov)?\.(us|com|cn)$", host, re.I))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -231,14 +249,8 @@ def _bot_photo(path: str, caption: str) -> None:
 async def notify_photo(zp, caption: str) -> None:
     try:
         shot = "/tmp/zoom_debug.png"
-        for attempt in (1, 2):
-            try:
-                await zp.screenshot(path=shot, timeout=10000)
-                await asyncio.wait_for(asyncio.to_thread(_bot_photo, shot, caption), 45)
-                return
-            except Exception as e:
-                log(f"Telegram screenshot failed ({type(e).__name__}, try {attempt})")
-                await asyncio.sleep(2)
+        await zp.screenshot(path=shot)
+        await asyncio.to_thread(_bot_photo, shot, caption)
     except Exception as e:
         log(f"Telegram screenshot failed ({type(e).__name__})")
 
@@ -303,15 +315,27 @@ class MediaStack:
 
 
 # --------------------------------------------------------------------------
-# FFmpeg recorder
+# FFmpeg recorder — crash-safe MKV segments with auto-restart + MP4 remux
 # --------------------------------------------------------------------------
 class FFmpegRecorder:
+    """Records to MKV segments (immediately seekable on crash).  If FFmpeg
+    dies mid-class it is restarted automatically.  On stop, segments are
+    concatenated and remuxed to a playable MP4 with faststart."""
+
     def __init__(self, out_path: str):
         self.out_path = out_path
-        self.proc = None
+        self.proc: subprocess.Popen | None = None
+        self._stop_evt = threading.Event()
+        self._seg_dir = Path(out_path).parent / "segments"
+        self._segments: list[str] = []
+        self._seg_idx = 0
+        self._thread: threading.Thread | None = None
 
-    def start(self) -> None:
-        Path(self.out_path).parent.mkdir(parents=True, exist_ok=True)
+    def _seg_path(self) -> str:
+        return str(self._seg_dir / f"seg_{self._seg_idx:04d}.mkv")
+
+    def _launch(self) -> subprocess.Popen:
+        path = self._seg_path()
         cmd = [
             "ffmpeg", "-y",
             "-thread_queue_size", "1024", "-f", "x11grab",
@@ -320,21 +344,40 @@ class FFmpegRecorder:
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
             "-crf", "22", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            self.out_path,
+            path,
         ]
-        self.proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=open(FFMPEG_LOG, "wb"),
+            stdout=subprocess.DEVNULL, stderr=open(FFMPEG_LOG, "ab"),
         )
+        self._segments.append(path)
+        return proc
+
+    def start(self) -> None:
+        self._seg_dir.mkdir(parents=True, exist_ok=True)
+        self.proc = self._launch()
         time.sleep(2)
         if self.proc.poll() is not None:
             tail = Path(FFMPEG_LOG).read_text(errors="ignore")[-600:]
             raise RuntimeError(f"FFmpeg exited immediately: {tail}")
+        self._thread = threading.Thread(target=self._watchdog, daemon=True)
+        self._thread.start()
 
-    def stop(self) -> None:
-        """Graceful 'q' so the MP4 is finalized and playable, with fallbacks."""
-        p = self.proc
+    def _watchdog(self) -> None:
+        """Restart FFmpeg automatically if it crashes."""
+        while not self._stop_evt.wait(2):
+            if self.proc and self.proc.poll() is not None:
+                self._seg_idx += 1
+                log(f"FFmpeg crashed (exit {self.proc.returncode}); restarting as segment {self._seg_idx}")
+                try:
+                    self.proc = self._launch()
+                    time.sleep(1)
+                except Exception as e:
+                    log(f"FFmpeg restart failed: {e}")
+
+    @staticmethod
+    def _graceful_stop(p: subprocess.Popen) -> None:
+        """Send 'q' so FFmpeg finalises the container, then escalate."""
         if not p or p.poll() is not None:
             return
         try:
@@ -353,6 +396,44 @@ class FFmpegRecorder:
             p.wait(timeout=60)
         except subprocess.TimeoutExpired:
             p.kill()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        self._graceful_stop(self.proc)
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._finalize()
+
+    def _finalize(self) -> None:
+        """Concatenate MKV segments and remux to a single MP4."""
+        valid = [s for s in self._segments
+                 if Path(s).exists() and Path(s).stat().st_size > 0]
+        if not valid:
+            return
+        if len(valid) == 1:
+            self._remux(valid[0], self.out_path)
+        else:
+            log(f"Joining {len(valid)} recording segments")
+            self._concat_remux(valid, self.out_path)
+
+    def _remux(self, src: str, dst: str) -> None:
+        r = sh(["ffmpeg", "-y", "-i", src, "-c", "copy",
+                "-movflags", "+faststart", dst])
+        if r.returncode != 0:
+            log("Remux to MP4 failed; copying MKV as fallback")
+            shutil.copy2(src, dst)
+
+    def _concat_remux(self, segs: list[str], dst: str) -> None:
+        lst = str(self._seg_dir / "concat.txt")
+        with open(lst, "w") as f:
+            for s in segs:
+                f.write(f"file '{Path(s).as_posix()}'\n")
+        r = sh(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", lst, "-c", "copy", "-movflags", "+faststart", dst])
+        if r.returncode != 0:
+            log("Segment concat failed; using largest segment as fallback")
+            biggest = max(segs, key=lambda s: Path(s).stat().st_size)
+            self._remux(biggest, dst)
 
 
 # --------------------------------------------------------------------------
@@ -394,6 +475,58 @@ async def inject_hide_css(page) -> None:
             await frame.evaluate(js, HIDE_CSS)
         except Exception:
             continue
+
+
+# --------------------------------------------------------------------------
+# Tab closer — background task
+# --------------------------------------------------------------------------
+async def _tab_closer(context, portal_url: str, allowed_extra: list[str], zoom_active: asyncio.Event):
+    """Closes tabs that are not the portal (before Zoom) or Zoom (always).
+    Once Zoom opens (zoom_active set), the portal tab is closed too."""
+    portal_host = urllib.parse.urlparse(portal_url).hostname or ""
+    portal_base = _domain_base(portal_host)
+    first_seen: dict[int, float] = {}
+
+    while True:
+        try:
+            now = time.monotonic()
+            pages = list(context.pages)
+            if len(pages) <= 1:
+                await asyncio.sleep(1)
+                continue
+
+            live = {id(p) for p in pages}
+            for p in pages:
+                first_seen.setdefault(id(p), now)
+            for k in list(first_seen):
+                if k not in live:
+                    del first_seen[k]
+
+            zoom_is_on = zoom_active.is_set() or any(_is_zoom_host(p.url) for p in pages)
+
+            for p in pages:
+                try:
+                    # 3-second grace period for pages that are still redirecting
+                    if now - first_seen.get(id(p), now) < 3:
+                        continue
+                    url = p.url
+                    if not url or url.startswith(("about:", "chrome://")):
+                        continue
+                    if _is_zoom_host(url):
+                        continue
+                    host = urllib.parse.urlparse(url).hostname or ""
+                    # Keep portal tab alive until Zoom is officially active
+                    if not zoom_is_on and (_host_matches(host, portal_host) or _host_matches(host, portal_base)):
+                        continue
+                    if any(_host_matches(host, h) for h in allowed_extra):
+                        continue
+                    log(f"Blocked an unwanted tab: {mask_url(url)}")
+                    await p.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(1)
 
 
 # --------------------------------------------------------------------------
@@ -444,25 +577,6 @@ async def open_todays_classes(page) -> None:
     await dismiss_popups(page)
 
 
-def card_locator(page):
-    join_any = page.locator("a, button, [role='button']").filter(
-        has_text=re.compile(r"\bjoin\b", re.I)
-    )
-    # .last = innermost matching element (outer wrappers also match)
-    return (
-        page.locator("div, li, tr, article, section")
-        .filter(has_text=KEYWORD_RE)
-        .filter(has=join_any)
-        .last
-    )
-
-
-def join_button(card):
-    return card.locator("a, button, [role='button']").filter(
-        has_text=re.compile(r"\bjoin\b", re.I)
-    ).first
-
-
 async def join_ready(btn) -> bool:
     try:
         if not await btn.is_visible() or not await btn.is_enabled():
@@ -481,6 +595,44 @@ async def join_ready(btn) -> bool:
         return False
 
 
+async def find_active_join(page):
+    """Find the join button for CLASS_KEYWORD. Searches candidate cards and
+    prefers the one whose Join button is ready/active. Returns (card, button)."""
+    join_any = page.locator("a, button, [role='button']").filter(
+        has_text=re.compile(r"\bjoin\b", re.I)
+    )
+    cards = (
+        page.locator("div, li, tr, article, section")
+        .filter(has_text=re.compile(re.escape(CLASS_KEYWORD), re.I))
+        .filter(has=join_any)
+    )
+    try:
+        count = await cards.count()
+    except Exception:
+        return None, None
+    if count == 0:
+        return None, None
+
+    fallback_card = None
+    fallback_btn = None
+    for i in reversed(range(count)):
+        c = cards.nth(i)
+        btn = c.locator("a, button, [role='button']").filter(
+            has_text=re.compile(r"\bjoin\b", re.I)
+        ).first
+        try:
+            if await btn.count() > 0:
+                if fallback_btn is None:
+                    fallback_card = c
+                    fallback_btn = btn
+                if await join_ready(btn):
+                    return c, btn
+        except Exception:
+            continue
+
+    return fallback_card, fallback_btn
+
+
 # --------------------------------------------------------------------------
 # State 3: precision Join-button polling
 # --------------------------------------------------------------------------
@@ -495,14 +647,10 @@ async def wait_and_join(context, page):
 
     while time.monotonic() < deadline:
         now = datetime.now(IST)
-        card = card_locator(page)
-        try:
-            found = await card.count() > 0
-        except Exception:
-            found = False
+        card, btn = await find_active_join(page)
+        found = card is not None and btn is not None
 
         if found and (now >= start_dt or not early_click_failed):
-            btn = join_button(card)
             if await join_ready(btn):
                 log("Join button is active; clicking")
                 prev_url = page.url
@@ -551,7 +699,7 @@ async def wait_and_join(context, page):
         await asyncio.sleep(1.5 if now < reload_until else 1.0)
 
     raise TimeoutError(
-        f"Join button for '{CLASS_LABEL}' did not become active within {MAX_WAIT_MIN} minutes"
+        f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} minutes"
     )
 
 
@@ -600,10 +748,10 @@ async def click_browser_join(zp) -> bool:
 
 async def _has_webclient(context, zp):
     for p in context.pages:
-        if re.search(r"/wc/\d+", p.url):
+        if "/wc/" in p.url:
             return p
         for f in p.frames:
-            if re.search(r"/wc/\d+", f.url):
+            if "/wc/" in f.url:
                 return p
     return None
 
@@ -635,21 +783,12 @@ async def to_web_client(context, zp):
             break
         await asyncio.sleep(0.5)
 
-    m = re.search(r"/(j|w)/(\d+)", zp.url)
-    if m:
-        mid = m.group(2)
-        # keep the original host and the ?pwd=... passcode, otherwise Zoom asks for a passcode
-        parts = urllib.parse.urlsplit(zp.url)
-        host = parts.netloc if "zoom." in parts.netloc else "app.zoom.us"
-        new_url = f"https://{host}/wc/{mid}/join" + (f"?{parts.query}" if parts.query else "")
-        log(f"Rewriting Zoom link to the web client: {mask_url(new_url)}")
+    if re.search(r"/(j|w)/", zp.url):
+        new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
+        log("Rewriting Zoom link to the web client")
         await zp.goto(new_url, wait_until="domcontentloaded")
         await asyncio.sleep(2)
         log(f"After rewrite URL: {mask_url(zp.url)}")
-        try:
-            sh(["xdotool", "key", "Escape"])
-        except Exception:
-            pass
     return zp
 
 
@@ -672,6 +811,14 @@ async def click_prejoin_join(zp) -> bool:
                 if await btn.count() and await btn.is_visible():
                     await btn.scroll_into_view_if_needed()
                     await btn.click(force=True, timeout=1500)
+                    try:
+                        await btn.evaluate("b => { b.click(); if (b.form) b.form.submit(); }")
+                    except Exception:
+                        pass
+                    try:
+                        await btn.press("Enter")
+                    except Exception:
+                        pass
                     log(f"Clicked pre-join button ({sel})")
                     return True
             except Exception:
@@ -688,6 +835,10 @@ async def click_prejoin_join(zp) -> bool:
                     if box and box["y"] > 250:
                         await b.scroll_into_view_if_needed()
                         await b.click(force=True, timeout=1500)
+                        try:
+                            await b.evaluate("b => b.click()")
+                        except Exception:
+                            pass
                         log(f"Clicked pre-join button at y={box['y']:.0f}")
                         return True
         except Exception:
@@ -698,14 +849,10 @@ async def click_prejoin_join(zp) -> bool:
 async def zoom_prejoin(zp) -> None:
     deadline = time.monotonic() + 60
     clicked_join = False
-    email_val = ZOOM_EMAIL or (PORTAL_USER if "@" in PORTAL_USER else f"{PORTAL_USER}@gmail.com")
-
     while time.monotonic() < deadline:
         if await in_meeting(zp):
             clicked_join = True
             break
-        if await on_signin_page(zp):
-            break  # wait_in_meeting handles it
         await click_browser_join(zp)
         await dismiss_popups(zp)
         await ensure_muted(zp)
@@ -722,21 +869,9 @@ async def zoom_prejoin(zp) -> None:
                     if not val.strip():
                         await name_in.fill(PARTICIPANT_NAME)
                         log(f"Filled participant name: {PARTICIPANT_NAME}")
+                        await name_in.press("Enter")
             except Exception:
-                pass
-
-            try:
-                email_in = frame.locator(
-                    "input#inputemail, input[name='inputemail'], input#email, "
-                    "input[name='email'], input[placeholder*='email' i]"
-                ).first
-                if await email_in.count() and await email_in.is_visible():
-                    val = await email_in.input_value()
-                    if not val.strip():
-                        await email_in.fill(email_val)
-                        log(f"Filled participant email: {redact(email_val)}")
-            except Exception:
-                pass
+                continue
 
         if await click_prejoin_join(zp):
             clicked_join = True
@@ -752,232 +887,54 @@ async def zoom_prejoin(zp) -> None:
         log("Join button on the pre-join screen was not found; continuing anyway")
 
 
-POPUP_SAFE_RE = re.compile(
-    r"^(ok|got it|i agree|agree|stay in meeting|stay muted|continue|"
-    r"accept|accept all|allow|dismiss|skip|not now|maybe later|"
-    r"no,?\s*thanks|continue without (?:audio|microphone)|close)$",
-    re.I,
-)
-POPUP_DENY_RE = re.compile(
-    r"\b(leave|end|exit|facebook|google|apple|microsoft|sso|sign.?in|"
-    r"log.?in|register|create.?account|join|download|install)\b",
-    re.I,
-)
-
-
-class SigninRequired(RuntimeError):
-    pass
-
-
-async def on_signin_page(zp) -> bool:
-    """True when Zoom (or an external IdP) is showing a sign-in page instead of the meeting."""
-    try:
-        if SIGNIN_URL_RE.search(zp.url):
-            return True
-    except Exception:
-        return False
-    text = await page_text(zp)
-    return bool(SIGNIN_TEXT_RE.search(text))
-
-
-async def zoom_signin(zp) -> bool:
-    """Optional: sign in with a dedicated Zoom account (ZOOM_EMAIL / ZOOM_PASS secrets)."""
-    if not (ZOOM_EMAIL and ZOOM_PASS):
-        return False
-    try:
-        email = zp.locator("input#email, input[name='account'], input[type='email']").first
-        pwd = zp.locator("input#password, input[type='password']").first
-        await email.wait_for(state="visible", timeout=8000)
-        await email.fill(ZOOM_EMAIL)
-        if not await pwd.is_visible():
-            await email.press("Enter")
-            await pwd.wait_for(state="visible", timeout=8000)
-        await pwd.fill(ZOOM_PASS)
-        await pwd.press("Enter")
-        await asyncio.sleep(5)
-        log("Submitted Zoom sign-in form")
-        return True
-    except Exception as e:
-        log(f"Zoom sign-in attempt failed ({type(e).__name__})")
-        return False
-
-
-def _is_safe_button(label: str) -> bool:
-    """True if the button text is a known safe popup-dismiss action."""
-    label = label.strip()
-    if not label or len(label) > 50:
-        return False
-    return bool(POPUP_SAFE_RE.match(label)) and not POPUP_DENY_RE.search(label)
+POPUP_PATTERNS = [
+    r"^got it$",
+    r"^ok$",
+    r"^i agree$",
+    r"^i understand$",
+    r"^accept( all)?( cookies)?$",
+    r"^allow( all)?( cookies)?$",
+    r"^dismiss$",
+    r"^skip$",
+    r"^not now$",
+    r"^maybe later$",
+    r"^no,? thanks$",
+    r"^continue without (audio|microphone)$",
+    r"^continue$",
+]
 
 
 async def dismiss_popups(zp) -> None:
-    """Dismiss any consent, disclaimer, recording, or audio modals in Zoom.
-
-    Safety layers (all three must pass before a click):
-      1. Bail entirely if the page is a sign-in / registration page.
-      2. Button text must match POPUP_SAFE_RE (exact whitelist).
-      3. Button text must NOT match POPUP_DENY_RE (deny-list for SSO/nav buttons).
-    """
-    # ── Gate: never click anything on a sign-in / registration page ──
-    if await on_signin_page(zp):
-        return
-
-    dismissed_ids: set[str] = set()  # de-duplicate across Playwright + JS passes
-
-    # ── Pass 1: Playwright locators (precise, per-frame) ──
-    # Scoped selectors first (inside a modal/dialog), then broad fallback.
-    SCOPED = [
-        ".zm-modal button",
-        "[role='dialog'] button",
-        ".modal-dialog button",
-        "[class*='modal'] button",
-        "[class*='disclaimer'] button",
-        "button.zm-btn--primary",
-        "button.zm-btn",
-    ]
-    CLOSE_BTNS = [
-        "[role='dialog'] button[aria-label*='close' i]",
-        ".zm-modal button[aria-label*='close' i]",
-        "button.zm-modal__header-close",
-        "button[aria-label='Close' i]",
-    ]
-    for frame in zp.frames:
-        # 1a. Buttons inside modals/dialogs — click if text is safe
-        for scope in SCOPED:
-            try:
-                buttons = frame.locator(scope)
-                count = await buttons.count()
-                for i in range(min(count, 10)):
-                    btn = buttons.nth(i)
-                    if not await btn.is_visible():
-                        continue
-                    label = ""
-                    try:
-                        label = (await btn.inner_text(timeout=500) or "").strip()
-                    except Exception:
-                        try:
-                            label = (await btn.get_attribute("aria-label") or "").strip()
-                        except Exception:
-                            continue
-                    btn_id = f"{scope}:{label}"
-                    if btn_id in dismissed_ids:
-                        continue
-                    if _is_safe_button(label):
-                        await btn.click(force=True, timeout=1500)
-                        dismissed_ids.add(btn_id)
-                        log(f"Dismissed popup: '{label}' (via {scope})")
-            except Exception:
-                continue
-
-        # 1b. Close (×) buttons on modals
-        for sel in CLOSE_BTNS:
-            try:
-                btn = frame.locator(sel).first
-                if await btn.count() and await btn.is_visible():
-                    await btn.click(force=True, timeout=1500)
-                    log(f"Dismissed popup via close button ({sel})")
-            except Exception:
-                continue
-
-    # ── Pass 2: JavaScript DOM sweep (catches elements Playwright misses) ──
-    js_dismiss = """
-    () => {
-        const SAFE = /^(ok|got it|i agree|agree|stay in meeting|stay muted|continue|accept|dismiss|close)$/i;
-        const DENY = /\\b(leave|end|exit|facebook|google|apple|microsoft|sso|sign.?in|log.?in|register|create|join|download|install)\\b/i;
-        let dismissed = 0;
-
-        // A. Dialogs / Modals: click safe buttons
-        const dlgs = document.querySelectorAll(
-            '[role="dialog"], .zm-modal, .modal-dialog, [class*="modal"], [class*="disclaimer"], [class*="dialog"]'
-        );
-        for (const dlg of dlgs) {
-            for (const b of dlg.querySelectorAll('button, [role="button"], .zm-btn')) {
-                const bt = (b.innerText || b.textContent || '').trim();
-                if (SAFE.test(bt) && !DENY.test(bt)) {
-                    try { b.click(); dismissed++; } catch(e) {}
-                }
-            }
-            const text = (dlg.innerText || '').toLowerCase();
-            if (/recording|recorded|transcript|terms of service|camera|microphone|cookie|consent|privacy|disclaimer/i.test(text)) {
-                try { dlg.style.display = 'none'; dismissed++; } catch(e) {}
-            }
-        }
-
-        // B. Primary Zoom buttons with safe text across the page
-        for (const b of document.querySelectorAll('.zm-btn--primary, button.zm-btn')) {
-            const bt = (b.innerText || b.textContent || '').trim();
-            if (SAFE.test(bt) && !DENY.test(bt)) {
-                try { b.click(); dismissed++; } catch(e) {}
-            }
-        }
-
-        // C. Remove backdrops / overlay blockers
-        for (const el of document.querySelectorAll(
-            '.zm-modal-backdrop, .modal-backdrop, .cdk-overlay-backdrop, [class*="backdrop"], [class*="overlay-shade"]'
-        )) {
-            try { el.remove(); dismissed++; } catch(e) {}
-        }
-
-        // D. Notifications / toasts (hide, don't click)
-        for (const el of document.querySelectorAll(
-            '.zm-notification, [class*="toast"], [class*="Toast"], [class*="notification"], [role="alert"]'
-        )) {
-            try { el.style.display = 'none'; dismissed++; } catch(e) {}
-        }
-
-        return dismissed;
-    }
-    """
+    await click_any(zp, POPUP_PATTERNS)
     for frame in zp.frames:
         try:
-            d_count = await frame.evaluate(js_dismiss)
-            if d_count:
-                log(f"Cleared {d_count} popup element(s) via JS")
+            close_btn = frame.locator(
+                "[role='dialog'] button[aria-label*='close' i], "
+                ".zm-modal button[aria-label*='close' i], "
+                "button[aria-label='Close' i]"
+            ).first
+            if await close_btn.count() and await close_btn.is_visible():
+                label = (await close_btn.get_attribute("aria-label") or "").lower()
+                if not re.search(r"leave|end|exit", label):
+                    await close_btn.click(timeout=800)
         except Exception:
-            pass
+            continue
 
 
 async def in_meeting(zp) -> bool:
     try:
-        host = urllib.parse.urlsplit(zp.url).netloc
-    except Exception:
-        return False
-    if "zoom." not in host or SIGNIN_URL_RE.search(zp.url):
-        return False
-    # Double-check page text: reject if sign-in / registration text is visible
-    text = await page_text(zp)
-    if SIGNIN_TEXT_RE.search(text):
-        return False
-    try:
         await zp.mouse.move(960, 1040)
     except Exception:
         pass
-    # Look for meeting-specific UI elements (not just canvas/video which exist on login pages)
     for frame in zp.frames:
         try:
-            meeting_ui = frame.locator(
+            loc = frame.locator(
                 "#wc-footer, #foot-bar, [class*='footer-chat'], "
-                "button[aria-label*='Leave' i], "
-                "button[aria-label*='Audio' i], button[aria-label*='Chat' i], "
-                "button[aria-label*='Participants' i], button[aria-label*='Reactions' i], "
-                "button[aria-label*='Raise Hand' i], "
-                "button[aria-label*='Q&A' i], "
-                "button[aria-label*='Share Screen' i], "
-                "[class*='speaker-active-container'], [class*='video-avatar'], "
-                "[class*='meeting-client'], [id*='meeting-client'], "
-                "[class*='participants-section'], [class*='chat-container']"
+                "button[aria-label*='Leave' i], button:has-text('Leave'), "
+                "button[aria-label*='Participants' i], button[aria-label*='Chat' i], "
+                "button[aria-label*='Reactions' i], button[aria-label*='Share Screen' i]"
             ).first
-            if await meeting_ui.count() and await meeting_ui.is_visible():
-                return True
-        except Exception:
-            continue
-    # Fallback: canvas/video ONLY if no sign-in indicators are present on the page
-    if re.search(r"(sign in|log in|create account|register|forgot password)", text, re.I):
-        return False
-    for frame in zp.frames:
-        try:
-            media = frame.locator("canvas, video").first
-            if await media.count() and await media.is_visible():
+            if await loc.count() and await loc.is_visible():
                 return True
         except Exception:
             continue
@@ -990,25 +947,13 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
     started_wait = time.monotonic()
     last_diag = -60.0
     sent_debug = False
-    signin_tries = 0
     while time.monotonic() < deadline:
         text = await page_text(zp)
         if END_RE.search(text):
             raise RuntimeError("Meeting ended before the recording could start")
-        if await on_signin_page(zp):
-            await notify_photo(zp, f"🔐 {CLASS_LABEL}: Zoom is asking for sign-in")
-            if signin_tries < 2 and await zoom_signin(zp):
-                signin_tries += 1
-                continue
-            raise SigninRequired(
-                "Zoom requires sign-in for this meeting (host enabled authenticated-only join). "
-                "Set ZOOM_EMAIL / ZOOM_PASS secrets for a Zoom account."
-            )
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
-            await dismiss_popups(zp)
             log("Inside the meeting")
-            await notify_photo(zp, f"✅ Confirmed inside {CLASS_LABEL} meeting")
             return
         elapsed = time.monotonic() - started_wait
         if elapsed - last_diag >= 30:
@@ -1022,7 +967,7 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if elapsed >= 4 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 5 < 2:
             await click_prejoin_join(zp)
         await asyncio.sleep(2)
-    raise RuntimeError("Could not confirm meeting UI within the wait window; not recording")
+    log("Could not confirm meeting UI; starting the recording anyway")
 
 
 async def join_audio(zp) -> None:
@@ -1069,10 +1014,7 @@ async def go_fullscreen(zp) -> None:
 async def monitor(zp, started: float) -> str:
     failures = 0
     last_housekeeping = 0.0
-    end_dt = class_end_dt()
     while True:
-        if end_dt and datetime.now(IST) >= end_dt:
-            return f"class end time {CLASS_END} IST reached"
         if time.monotonic() - started >= MAX_MEETING_SEC:
             return "maximum duration reached"
         if zp.is_closed():
@@ -1090,15 +1032,15 @@ async def monitor(zp, started: float) -> str:
             if failures > 20:
                 return "page became unreachable"
 
-        if time.monotonic() - last_housekeeping > 3:
+        if time.monotonic() - last_housekeeping > 10:
             last_housekeeping = time.monotonic()
             await dismiss_popups(zp)
             await inject_hide_css(zp)
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
 
 # --------------------------------------------------------------------------
-# State 7: Telegram upload (MTProto, auto-split)
+# State 7: Telegram upload (MTProto, auto-split with size re-check)
 # --------------------------------------------------------------------------
 def probe_duration(path: str) -> float:
     out = sh([
@@ -1120,6 +1062,28 @@ def make_thumb(path: str) -> str | None:
     return thumb if res.returncode == 0 and os.path.exists(thumb) else None
 
 
+def _resplit(part_path: str) -> list[str]:
+    """Re-split a single part that exceeded the Telegram size limit."""
+    size = os.path.getsize(part_path)
+    duration = probe_duration(part_path)
+    if duration <= 0:
+        return [part_path]
+    n_chunks = math.ceil(size / (TG_SIZE_LIMIT * 0.85))
+    seg_time = max(30, int(duration / n_chunks))
+    stem = Path(part_path).stem
+    out_dir = Path(part_path).parent / f"{stem}_resplit"
+    out_dir.mkdir(exist_ok=True)
+    res = sh([
+        "ffmpeg", "-y", "-i", part_path, "-map", "0", "-c", "copy",
+        "-f", "segment", "-segment_time", str(seg_time),
+        "-reset_timestamps", "1", "-segment_format", "mp4",
+        "-segment_format_options", "movflags=+faststart",
+        str(out_dir / f"{stem}_sub_%03d.mp4"),
+    ])
+    sub_parts = sorted(str(p) for p in out_dir.glob(f"{stem}_sub_*.mp4"))
+    return sub_parts if sub_parts else [part_path]
+
+
 def split_file(path: str) -> list[str]:
     size = os.path.getsize(path)
     duration = probe_duration(path)
@@ -1139,7 +1103,16 @@ def split_file(path: str) -> list[str]:
     parts = sorted(str(p) for p in out_dir.glob("part_*.mp4"))
     if res.returncode != 0 or not parts:
         raise RuntimeError("Splitting the recording failed")
-    return parts
+
+    # Re-check: if any part still exceeds the limit, re-split it
+    final: list[str] = []
+    for part in parts:
+        if os.path.getsize(part) > TG_SIZE_LIMIT:
+            log(f"Part {Path(part).name} exceeds Telegram size limit; re-splitting")
+            final.extend(_resplit(part))
+        else:
+            final.append(part)
+    return final
 
 
 def _chat_id():
@@ -1153,7 +1126,7 @@ async def upload_to_telegram(path: str) -> None:
     size = os.path.getsize(path)
     parts = [path] if size <= TG_SIZE_LIMIT else await asyncio.to_thread(split_file, path)
     total = len(parts)
-    base_caption = f"🎥 {CLASS_LABEL} | {datetime.now(IST).strftime('%Y-%m-%d')}"
+    base_caption = f"🎥 {CLASS_KEYWORD} | {datetime.now(IST).strftime('%Y-%m-%d')}"
     log(f"Uploading {total} file(s), {size / 1024**3:.2f} GB total")
 
     async with Client(
@@ -1191,12 +1164,6 @@ async def main() -> int:
         print("Missing required environment variables: " + ", ".join(missing), file=sys.stderr)
         return 2
 
-    end_dt = class_end_dt()
-    if end_dt and datetime.now(IST) >= end_dt:
-        print(f"Class end time {CLASS_END} IST has already passed; nothing to record", file=sys.stderr)
-        await notify(f"⚠️ Alert: {CLASS_LABEL} run started after its end time {CLASS_END} IST; skipped")
-        return 1
-
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     try:
@@ -1208,6 +1175,8 @@ async def main() -> int:
     recorder = FFmpegRecorder(RECORD_PATH)
     error: str | None = None
     end_reason = ""
+    tab_closer_task: asyncio.Task | None = None
+    zoom_active = asyncio.Event()
 
     try:
         media.start()
@@ -1219,84 +1188,103 @@ async def main() -> int:
         (prof_dir / "Default" / "Preferences").write_text(json.dumps({
             "protocol_handler": {
                 "excluded_schemes": {"zoommtg": True, "zoomus": True, "zoom": True}
-            },
-            "custom_handlers": {
-                "ignored_protocol_handlers": [
-                    {"protocol": "zoommtg", "url": ""},
-                    {"protocol": "zoomus", "url": ""},
-                    {"protocol": "zoom", "url": ""}
-                ]
             }
         }))
 
         async with async_playwright() as pw:
-            # permissions=[] hard-blocks microphone and camera
             context = await pw.chromium.launch_persistent_context(
                 str(prof_dir),
                 headless=False,
                 args=CHROMIUM_ARGS,
                 ignore_default_args=["--enable-automation"],
                 permissions=[],
+                accept_downloads=False,
                 no_viewport=True,
             )
+
+            # --- Inject popup_guard.js into every page/frame ---------------
+            guard_js = Path("/app/popup_guard.js")
+            if not guard_js.exists():
+                guard_js = Path(__file__).parent / "popup_guard.js"
+            if guard_js.exists():
+                await context.add_init_script(path=str(guard_js))
+                log("Injected popup_guard.js")
+            else:
+                log("popup_guard.js not found; skipping in-page popup guard")
+
+            # --- Stealth + zoommtg:// blocker init script ------------------
             await context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
                 "window.chrome = window.chrome || { runtime: {} };"
-                # Block zoommtg:// zoomus:// zoom:// protocol navigations entirely
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
-                # Intercept link clicks that trigger external protocol handlers
-                "document.addEventListener('click',function(e){"
-                "  var a=e.target.closest&&e.target.closest('a');"
-                "  if(a&&a.href&&/^zoom(mtg|us)?:/i.test(a.href)){e.preventDefault();e.stopPropagation();}"
-                "},true);"
-                # Override location.assign and location.replace for zoom protocols
-                "const _assign=location.assign.bind(location),_replace=location.replace.bind(location);"
-                "location.assign=function(u){if(u&&/^zoom(mtg|us)?:/i.test(String(u)))return;_assign(u)};"
-                "location.replace=function(u){if(u&&/^zoom(mtg|us)?:/i.test(String(u)))return;_replace(u)};"
             )
+
+            # --- Block zoommtg:// navigation at the network layer ---------
+            async def _abort_route(route):
+                await route.abort()
+
             await context.route(
                 re.compile(r"^zoom(mtg|us)?://", re.I),
-                lambda r: r.abort(),
+                _abort_route,
             )
+
+            # --- Block tracker / ad domains --------------------------------
+            if BLOCK_TRACKERS and TRACKER_DOMAINS:
+                async def _block_tracker(route):
+                    await route.abort()
+
+                await context.route(TRACKER_RE, _block_tracker)
+                log(f"Tracker blocking enabled ({len(TRACKER_DOMAINS)} domains)")
+
+            # --- Auto-dismiss JS alert/confirm, refuse downloads -----------
             async def _dismiss_dialog(d):
                 try:
                     await d.dismiss()
                 except Exception:
                     pass
 
-            def _attach_dialog_handler(p):
+            async def _cancel_download(dl):
+                try:
+                    await dl.cancel()
+                except Exception:
+                    pass
+
+            def _attach_page_handlers(p):
                 p.on("dialog", lambda d: asyncio.create_task(_dismiss_dialog(d)))
-            context.on("page", _attach_dialog_handler)
+                p.on("download", lambda dl: asyncio.create_task(_cancel_download(dl)))
+
+            context.on("page", _attach_page_handlers)
             for p in context.pages:
-                _attach_dialog_handler(p)
+                _attach_page_handlers(p)
+
+            # --- Background tab closer -------------------------------------
+            tab_closer_task = asyncio.create_task(
+                _tab_closer(context, PORTAL_URL, ALLOWED_HOSTS, zoom_active)
+            )
+
             page = context.pages[0] if context.pages else await context.new_page()
             try:
                 await login(page)
                 await open_todays_classes(page)
                 zoom_page = await wait_and_join(context, page)
 
+                zoom_active.set()
+                await zoom_page.bring_to_front()
+
                 zoom_page = await to_web_client(context, zoom_page)
                 await zoom_prejoin(zoom_page)
                 await wait_in_meeting(zoom_page)
                 await join_audio(zoom_page)
 
-                await dismiss_popups(zoom_page)
-                await go_fullscreen(zoom_page)
-                await dismiss_popups(zoom_page)
-
                 recorder.start()
                 started = time.monotonic()
                 log("Recording started")
-                await notify(f"✅ Joined {CLASS_LABEL} & started 1080p recording")
-                # Send a screenshot 10s after recording starts so user can verify content
-                await asyncio.sleep(10)
-                await notify_photo(zoom_page, f"🎥 {CLASS_LABEL}: Recording in progress")
+                await notify("✅ Joined class & started 1080p recording")
 
+                await go_fullscreen(zoom_page)
                 end_reason = await monitor(zoom_page, started)
-                elapsed_min = (time.monotonic() - started) / 60
-                log(f"Recording ends: {end_reason} (after {elapsed_min:.1f} min)")
-                await notify(f"🛑 {CLASS_LABEL} recording ended: {end_reason} (after {elapsed_min:.1f} min)")
+                log(f"Recording ends: {end_reason}")
             except asyncio.CancelledError:
                 error = "run was cancelled"
                 raise
@@ -1305,7 +1293,9 @@ async def main() -> int:
                 log(f"Error: {redact(error)[:300]}")
                 await notify(f"⚠️ Alert: {error}")
             finally:
-                # ALWAYS finalize FFmpeg so the MP4 is valid and uploadable
+                if tab_closer_task:
+                    tab_closer_task.cancel()
+                # ALWAYS finalize FFmpeg so the recording is valid and uploadable
                 await asyncio.to_thread(recorder.stop)
                 try:
                     await context.close()
@@ -1329,6 +1319,7 @@ async def main() -> int:
             log(f"Upload failed ({type(e).__name__})")
             await notify(f"⚠️ Alert: recording finished but Telegram upload failed ({type(e).__name__})")
             return 1
+        await notify("✅ Uploaded recording to Telegram")
     else:
         if not error:
             await notify("⚠️ Alert: no recording was produced")

@@ -3,11 +3,7 @@
 Records your daily live class from the student portal on GitHub's free servers
 (no device of your own needed) and sends the 1080p MP4 to your Telegram.
 
-Daily schedule (IST): **Advance Java 6:00-7:30 PM** first (recording is cut at
-exactly 7:30 PM), then **React JS 7:30 PM** (90 min). Each class is its own run
-(5:47 PM and 7:17 PM triggers) and sends its own video to Telegram.
-
-How it works: GitHub Actions starts a container shortly before class, logs in to the
+How it works: GitHub Actions starts a container at 7:22 PM IST, logs in to the
 portal, waits for the **Join** button to become active, joins the Zoom web
 client with mic and camera off, records the screen and audio with FFmpeg, then
 uploads the video to Telegram (files over ~1.95 GB are split automatically).
@@ -17,10 +13,11 @@ uploads the video to Telegram (files over ~1.95 GB are split automatically).
 ├── Dockerfile
 ├── requirements.txt
 ├── recorder.py
+├── popup_guard.js          # in-page popup / cookie-banner dismisser
 ├── .env.example
 └── .github/workflows/
     ├── build-image.yml     # builds the image once into ghcr.io
-    └── record-class.yml    # Java 5:47 PM + React 7:17 PM triggers + manual run
+    └── record-class.yml    # daily 7:22 PM IST + manual run
 ```
 
 ## One-time setup
@@ -46,16 +43,6 @@ uploads the video to Telegram (files over ~1.95 GB are split automatically).
 4. **Settings -> Actions -> General -> Workflow permissions**: allow
    *Read and write permissions* (needed to publish the image).
 
-### Turning on the Advance Java class
-The Java run is skipped until you switch it on, so there are no false alerts
-before the class exists. Under **Settings -> Secrets and variables -> Actions ->
-Variables** add either:
-- `JAVA_START_DATE` = first class day, e.g. `2026-11-24` (turns on by itself), or
-- `JAVA_ENABLED` = `true`.
-
-Optional variables: `JAVA_KEYWORD` (default `Advance Java|Advanced Java`,
-`|` separates alternatives), `JAVA_START` (`18:00`), `JAVA_END` (`19:30`).
-
 ### 3. Build the image
 Pushing to `main` runs **Build recorder image** automatically. Wait for the
 green tick in the **Actions** tab. If you want the image private-safe, leave
@@ -66,6 +53,21 @@ its package visibility as is; the daily workflow logs in with the built-in token
 `class_start` to a class that is live right now (or starting within 45 minutes).
 Watch the Telegram alerts and the run log. Fix any selector problems (see below).
 
+## Popup protection (Chrome + Zoom)
+- **Extra tabs/windows**: any tab that is not the portal or Zoom is closed within 1 s;
+  once Zoom opens, it is the only tab allowed (and is brought to front).
+- **Zoom pages**: `window.open()` is disabled, downloads are refused, and the
+  "Open Zoom Meetings?" app prompt is avoided by using the web client directly.
+- **Browser prompts**: notifications, mic/camera, password-save, translate,
+  crash bubbles and similar Chrome bubbles are disabled; JS alert/confirm dialogs are auto-handled.
+- **In-page popups**: cookie banners, "Got it", "Not now", recording notice,
+  "Stay muted", toasts and similar are auto-dismissed by `popup_guard.js`.
+  It never touches dialogs with input fields, passcode/name prompts, Join Audio,
+  or anything about Leave/End.
+- **Trackers/ads** (Google Analytics, DoubleClick, Hotjar, ...) are blocked. Set
+  variable `BLOCK_TRACKERS=0` if the portal ever misbehaves; use `ALLOWED_HOSTS`
+  to permit extra domains.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -74,13 +76,14 @@ Watch the Telegram alerts and the run log. Fix any selector problems (see below)
 | Join button never found | Make sure `CLASS_KEYWORD` matches text on the class card exactly (e.g. `React JS`). |
 | No sound in recording | Zoom may need the audio-join step; check the run log, and re-run a test. |
 | Telegram upload fails | The bot must have started a chat with you (or be admin in the channel). Re-check `TG_CHAT_ID`. |
+| Portal tab closed unexpectedly | Add the portal's other domain to the `ALLOWED_HOSTS` variable. |
 | Schedule did not run | GitHub pauses schedules after 60 days with no repo activity, and may start a few minutes late. Re-enable in the Actions tab. |
 
 ## Notes
 - Public repo logs are public. The script masks secrets and meeting-link
   passwords, but never `print` extra details if you edit it.
 - Check that your institute allows recording its classes.
-- To skip Sundays, change the cron to `50 13 * * 1-6`.
+- To skip Sundays, change the cron to `52 13 * * 1-6`.
 
 ## Local test (optional, needs Docker)
 ```bash
