@@ -120,7 +120,7 @@ TRACKER_RE = re.compile(
     re.I,
 )
 
-TG_SIZE_LIMIT = int(1.95 * 1024**3)  # single-file ceiling for MTProto upload
+TG_SIZE_LIMIT = 1950 * 1024 * 1024  # ~1.90 GB, safe headroom below Telegram 2000 MB limit
 
 REQUIRED = [
     "PORTAL_URL", "PORTAL_USER", "PORTAL_PASS",
@@ -1067,8 +1067,10 @@ def probe_duration(path: str) -> float:
 
 def make_thumb(path: str) -> str | None:
     thumb = str(Path(path).with_suffix(".jpg"))
+    dur = probe_duration(path)
+    seek = "1" if dur < 10 else "10"
     res = sh([
-        "ffmpeg", "-y", "-ss", "10", "-i", path, "-vframes", "1",
+        "ffmpeg", "-y", "-ss", seek, "-i", path, "-vframes", "1",
         "-vf", "scale=320:-2", "-q:v", "6", thumb,
     ])
     return thumb if res.returncode == 0 and os.path.exists(thumb) else None
