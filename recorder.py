@@ -697,15 +697,68 @@ async def find_active_join(page):
 # State 3: precision Join-button polling
 # --------------------------------------------------------------------------
 async def wait_and_join(context, page):
+    now = datetime.now(IST)
     start_dt = class_start_dt()
-    reload_until = start_dt - timedelta(seconds=15)
+
+    # If configured start time is more than MAX_WAIT_MIN (45 mins) in the future,
+    # this is an immediate manual test run (user triggered now without setting class_start).
+    diff_to_start = (start_dt - now).total_seconds()
+    if diff_to_start > MAX_WAIT_MIN * 60:
+        step.record(
+            "Test Run Detected",
+            "ℹ️",
+            f"Configured CLASS_START ({CLASS_START} IST) is {diff_to_start / 3600:.1f} hours away. Treating as immediate test run.",
+        )
+        start_dt = now
+        diff_to_start = 0
+
     deadline = time.monotonic() + MAX_WAIT_MIN * 60
+    last_wait_log = 0.0
+    last_reload = time.monotonic()
+
+    # ----------------------------------------------------------------------
+    # Phase 1: If we arrived before class time, WAIT CALMLY until start_dt!
+    # DO NOT click before class time! DO NOT hammer reload repeatedly!
+    # ----------------------------------------------------------------------
+    while datetime.now(IST) < start_dt - timedelta(seconds=15):
+        now = datetime.now(IST)
+        rem_sec = int((start_dt - now).total_seconds())
+        if rem_sec <= 15:
+            break
+
+        # Log a peaceful countdown update every 30 seconds
+        if time.monotonic() - last_wait_log >= 30 or last_wait_log == 0.0:
+            last_wait_log = time.monotonic()
+            mins, secs = divmod(rem_sec, 60)
+            step.record(
+                "Waiting for Class Time",
+                "⏳",
+                f"Class '{CLASS_KEYWORD}' starts at {CLASS_START} IST ({mins}m {secs:02d}s remaining). Waiting quietly for class start time...",
+            )
+
+        sleep_time = min(5.0, max(1.0, float(rem_sec - 15)))
+        await asyncio.sleep(sleep_time)
+
+    # ----------------------------------------------------------------------
+    # Phase 2: Class start time has arrived!
+    # Do ONE clean refresh of Today's Classes tab to fetch the live active Join button.
+    # ----------------------------------------------------------------------
+    step.record(
+        "Class Time Reached",
+        "🔄",
+        f"Reached {CLASS_START} IST! Refreshing portal to fetch live Join button...",
+    )
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await open_todays_classes(page)
+    except Exception as e:
+        log(f"Initial class reload hiccup ({type(e).__name__})")
     last_reload = time.monotonic()
     last_wait_log = 0.0
-    reloaded_at_start = False
-    early_click_failed = False
-    step.record("Waiting for Join", "⏳", f"Searching for '{CLASS_KEYWORD}' card (class starts {CLASS_START} IST)")
 
+    # ----------------------------------------------------------------------
+    # Phase 3: Class is live. Scan for Join button, click, and enter Zoom.
+    # ----------------------------------------------------------------------
     while time.monotonic() < deadline:
         now = datetime.now(IST)
         card, btn = await find_active_join(page)
@@ -713,20 +766,19 @@ async def wait_and_join(context, page):
 
         if found:
             is_active = await join_ready(btn)
-            if is_active and (now >= start_dt or not early_click_failed):
-                step.record("Join Button", "🎯", f"Join button is active and clickable! Clicking Join for '{CLASS_KEYWORD}'")
-                prev_url = page.url
-                zp = await click_join(
-                    context, page, btn, wait_sec=25 if now >= start_dt else 12
+            if is_active:
+                step.record(
+                    "Join Button",
+                    "🎯",
+                    f"Join button is active and clickable! Clicking Join for '{CLASS_KEYWORD}'...",
                 )
+                prev_url = page.url
+                zp = await click_join(context, page, btn, wait_sec=25)
                 if zp is not None:
                     step.record("Join Button", "✅", "Clicked Join button; Zoom window opened successfully")
                     return zp
-                if now < start_dt:
-                    early_click_failed = True
-                    step.record("Join Button", "⏳", f"Join click did not open Zoom yet; waiting until {CLASS_START} IST")
-                else:
-                    step.record("Join Button", "🔄", "Join click did not open Zoom yet; retrying after reload")
+
+                step.record("Join Button", "🔄", "Join click did not open Zoom yet; refreshing portal to retry")
                 try:
                     if page.url != prev_url:
                         await page.goto(prev_url, wait_until="domcontentloaded")
@@ -741,26 +793,27 @@ async def wait_and_join(context, page):
             else:
                 if time.monotonic() - last_wait_log >= 30:
                     last_wait_log = time.monotonic()
-                    time_diff = int((start_dt - now).total_seconds())
-                    wait_status = f"{time_diff}s until start" if time_diff > 0 else "class time reached; waiting for host to activate Join button"
-                    step.record("Waiting for Join", "⏳", f"Found '{CLASS_KEYWORD}' card. Waiting for Join button to become clickable ({wait_status})...")
+                    step.record(
+                        "Waiting for Host",
+                        "⏳",
+                        f"Found '{CLASS_KEYWORD}' card. Waiting for host/teacher to activate Join button...",
+                    )
         else:
             if time.monotonic() - last_wait_log >= 30:
                 last_wait_log = time.monotonic()
-                step.record("Waiting for Join", "🔍", f"Waiting for '{CLASS_KEYWORD}' card to appear on portal...")
+                step.record(
+                    "Searching Card",
+                    "🔍",
+                    f"Searching for '{CLASS_KEYWORD}' card in Today's Classes tab...",
+                )
 
+        # Refresh every 30 seconds if host hasn't activated button yet
         since_reload = time.monotonic() - last_reload
         need_reload = False
-        if now < reload_until and since_reload >= 15:
-            need_reload = True  # lightweight refresh every 15 s until 7:29:45
-        elif now >= start_dt and not reloaded_at_start:
-            need_reload = True  # one refresh exactly at the start time
-            reloaded_at_start = True
-            step.record("Waiting for Join", "🔄", f"Reached {CLASS_START} IST; refreshing portal to check for active button")
-        elif now >= start_dt and since_reload >= 30:
-            need_reload = True  # safety net if the button is still inactive
+        if since_reload >= 30:
+            need_reload = True
         elif not found and since_reload >= 10:
-            need_reload = True  # card missing: page state probably lost
+            need_reload = True
 
         if need_reload:
             try:
@@ -770,7 +823,7 @@ async def wait_and_join(context, page):
                 log(f"Reload hiccup ({type(e).__name__})")
             last_reload = time.monotonic()
 
-        await asyncio.sleep(1.5 if now < reload_until else 1.0)
+        await asyncio.sleep(1.5)
 
     step.record("Waiting for Join", "❌", f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} mins")
     raise TimeoutError(
