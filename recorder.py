@@ -49,6 +49,14 @@ def _env(name: str, default: str = "") -> str:
     return val if val else default.strip()
 
 
+def _int_env(name: str, default: int) -> int:
+    val = _env(name)
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
 PORTAL_URL = _env("PORTAL_URL")
 if PORTAL_URL and not PORTAL_URL.startswith(("http://", "https://")):
     PORTAL_URL = "https://" + PORTAL_URL
@@ -62,12 +70,16 @@ TG_CHAT_ID = _env("TG_CHAT_ID")
 CLASS_KEYWORD = _env("CLASS_KEYWORD", "React JS")
 CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
 CLASS_END = _env("CLASS_END", "")  # HH:MM, IST (optional hard stop)
-CLASS_DURATION_MIN = int(_env("CLASS_DURATION_MIN", "90"))
-MAX_WAIT_MIN = int(_env("MAX_WAIT_MIN", "45"))  # wait for Join to activate
-MAX_MEETING_SEC = int(_env("MAX_MEETING_SEC", str(CLASS_DURATION_MIN * 60)))
+CLASS_DURATION_MIN = _int_env("CLASS_DURATION_MIN", 90)
+MAX_WAIT_MIN = _int_env("MAX_WAIT_MIN", 45)  # wait for Join to activate
+MAX_MEETING_SEC = _int_env("MAX_MEETING_SEC", CLASS_DURATION_MIN * 60)
 if CLASS_END and not os.environ.get("MAX_MEETING_SEC", "").strip():
     try:
-        sh, sm = (int(x) for x in CLASS_START.split(":"))
+        now_dt = datetime.now(IST)
+        if CLASS_START.lower() in ("now", "test", "immediate"):
+            sh, sm = now_dt.hour, now_dt.minute
+        else:
+            sh, sm = (int(x) for x in CLASS_START.split(":"))
         eh, em = (int(x) for x in CLASS_END.split(":"))
         diff_sec = ((eh * 60 + em) - (sh * 60 + sm)) * 60
         if diff_sec < 0:
@@ -181,10 +193,11 @@ class StepTracker:
     def _init_summary(self):
         if not self.path:
             return
+        time_disp = (CLASS_START or 'Immediate') + " IST"
         header = (
             f"## 🎥 Zoom Class Recording Summary\n\n"
             f"- **Class Keyword:** `{CLASS_KEYWORD}`\n"
-            f"- **Class Time:** `{CLASS_START} IST`" + (f" - `{CLASS_END} IST`" if CLASS_END else "") + "\n"
+            f"- **Class Time:** `{time_disp}`" + (f" - `{CLASS_END} IST`" if CLASS_END else "") + "\n"
             f"- **Date:** `{datetime.now(IST).strftime('%Y-%m-%d')}`\n\n"
             f"| Step | Status | Time (IST) | Details |\n"
             f"| :--- | :---: | :---: | :--- |\n"
@@ -201,7 +214,7 @@ class StepTracker:
         log(f"{status} [{step_name}] {details}".strip())
         if not self.path:
             return
-        safe_details = details.replace("|", "/")
+        safe_details = details.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
         row = f"| {step_name} | {status} | {now_str} | {safe_details} |\n"
         try:
             with open(self.path, "a", encoding="utf-8") as f:
@@ -255,6 +268,7 @@ def keyword_pattern(kw: str) -> re.Pattern:
 
 
 def _domain_base(host: str) -> str:
+    host = host.split(":")[0]
     parts = host.split(".")
     if len(parts) > 2 and parts[-2] in ("edu", "ac", "co", "gov", "org", "res", "net", "com"):
         return ".".join(parts[-3:])
@@ -588,7 +602,7 @@ async def _tab_closer(context, portal_url: str, allowed_extra: list[str], zoom_a
                 if k not in live:
                     del first_seen[k]
 
-            zoom_is_on = zoom_active.is_set() or any(_is_zoom_host(p.url) for p in pages)
+            zoom_is_on = zoom_active.is_set()
 
             for p in pages:
                 try:
@@ -946,13 +960,13 @@ async def click_join(context, page, btn, wait_sec: int = 25):
     end = time.monotonic() + wait_sec
     while time.monotonic() < end:
         for p in context.pages:
-            if re.search(r"zoom\.(us|com)", p.url):
+            if _is_zoom_host(p.url):
                 log(f"Captured Zoom URL: {mask_url(p.url)}")
                 return p
         await asyncio.sleep(0.5)
 
     for p in list(context.pages):
-        if p not in known_pages and not re.search(r"zoom\.(us|com)", p.url):
+        if p not in known_pages and not _is_zoom_host(p.url):
             try:
                 await p.close()
             except Exception:
@@ -1095,7 +1109,7 @@ async def zoom_prejoin(zp) -> None:
                 name_in = frame.locator(
                     "input#inputname, input[name='inputname'], input#display_name, "
                     "input[name='display_name'], input#input-for-name, "
-                    "input[placeholder*='name' i], input[type='text']:visible"
+                    "input[placeholder*='name' i], input[aria-label*='name' i], input[type='text']:visible"
                 ).first
                 if await name_in.count() and await name_in.is_visible():
                     val = await name_in.input_value()
@@ -1561,9 +1575,10 @@ async def main() -> int:
             finally:
                 if tab_closer_task:
                     tab_closer_task.cancel()
-                # ALWAYS finalize FFmpeg so the recording is valid and uploadable
-                step.record("Video Processing", "🔄", "Stopping FFmpeg & concatenating/remuxing segments to MP4 (+faststart)")
-                await asyncio.to_thread(recorder.stop)
+                # Only finalize FFmpeg if recording was actually started
+                if recorder.proc is not None:
+                    step.record("Video Processing", "🔄", "Stopping FFmpeg & concatenating/remuxing segments to MP4 (+faststart)")
+                    await asyncio.to_thread(recorder.stop)
                 try:
                     await context.close()
                 except Exception:
