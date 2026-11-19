@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       class_keyword:
-        description: "Class name to look for on the portal"
+        description: "Class name on portal (e.g. React JS or Advance Java|Advanced Java)"
         required: false
         default: ""
       class_start:
-        description: "Class start time in IST (HH:MM)"
+        description: "Class start time in IST (HH:MM) - or 'now' for immediate test run"
         required: false
         default: ""
       class_end:

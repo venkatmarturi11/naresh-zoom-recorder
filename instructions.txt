@@ -19,7 +19,7 @@ Here is a short note you can save to your phone (e.g., Apple Notes / Google Keep
 1. Open the Web Scheduler (https://class-scheduler.class-scheduler.workers.dev/) and tap **▶️ Test Run Now**, OR:
 2. Open the GitHub workflow link above in your mobile browser (or **GitHub** app → repo **Actions** → **Record class**).
 3. Tap **Run workflow**.
-4. *(Optional)* Enter `class_keyword` (e.g., `React JS`), `class_start` (`HH:MM` in IST, e.g., `19:30`), `class_end` (e.g., `21:00`). Leave blank to use defaults.
+4. *(Optional)* Enter `class_keyword` (e.g., `React JS` or `Advance Java|Advanced Java`), `class_start` (`HH:MM` in IST, e.g. `19:30`, or `now` to join an ongoing class immediately), `class_end` (e.g., `19:30` hard stop). Leave blank to use defaults.
 5. Tap the green **Run workflow** button and watch Telegram for updates.
 
 ---
