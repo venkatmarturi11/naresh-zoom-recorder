@@ -22,7 +22,7 @@
       const _open = window.open;
       window.open = function (u) {
         try {
-          if (!u) return null;
+          if (!u) return _open.apply(window, arguments);
           const url = new URL(String(u), location.href);
           if (/^https?:$/.test(url.protocol) &&
               /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(url.hostname)) {

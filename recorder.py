@@ -1004,7 +1004,11 @@ async def click_browser_join(zp) -> bool:
             loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
             if await loc.count() and await loc.is_visible():
                 await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=3000)
+                await loc.click(force=True, timeout=3000)
+                try:
+                    await loc.evaluate("b => { b.click(); if (b.href && !b.href.startsWith('javascript:')) window.location.href = b.href; }")
+                except Exception:
+                    pass
                 return True
         except Exception:
             continue
@@ -1012,6 +1016,24 @@ async def click_browser_join(zp) -> bool:
 
 
 WC_MEETING_RE = re.compile(r"/wc/(join/)?\d{6,}", re.I)
+
+
+def make_web_client_url(url: str) -> str | None:
+    """Directly converts a meeting/webinar launch URL (/w/ID or /j/ID or /s/ID) to /wc/ID/join."""
+    m = re.search(r"/(?:w|j|s)/(\d+)", url)
+    if not m:
+        return None
+    meeting_id = m.group(1)
+    parsed = urllib.parse.urlparse(url)
+    new_path = f"/wc/{meeting_id}/join"
+    return urllib.parse.urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        new_path,
+        parsed.params,
+        parsed.query,
+        parsed.fragment,
+    ))
 
 
 def is_generic_join_page(zp) -> bool:
@@ -1070,10 +1092,10 @@ async def browser_join_href(zp) -> str | None:
 
 async def _has_webclient(context, zp):
     for p in context.pages:
-        if "/wc/" in p.url:
+        if "/wc/" in p.url and not is_generic_join_page(p):
             return p
         for f in p.frames:
-            if "/wc/" in f.url:
+            if "/wc/" in f.url and not is_generic_join_page(p):
                 return p
     return None
 
@@ -1119,13 +1141,16 @@ async def zoom_signin(zp) -> bool:
 
 async def to_web_client(context, zp):
     """Zoom launch page -> click 'Join from your browser' -> pre-join screen.
-    Exactly what a person does: ONE click (the link's tk token is single-use),
-    no Escape key (it would abort the loading page), the link is never rewritten."""
+    Guarantees entering the Web Client:
+    1. Clicks 'Join from your browser'
+    2. If page stays on launch screen, opens direct /wc/{meeting_id}/join URL."""
     step.record("Zoom Client", "💻", "Zoom launch page: choosing 'Join from your browser'")
     deadline = time.monotonic() + 120
     last_click = 0.0
     clicks = 0
     last_good, reloads, generic_retries = LAST_ZOOM_URL, 0, 0
+    tried_direct = False
+
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
         if found:
@@ -1169,22 +1194,40 @@ async def to_web_client(context, zp):
             last_good = zp.url
         if await on_signin_page(zp):
             return zp  # zoom_prejoin / wait_in_meeting deal with it
-        # Click once, then give Zoom plenty of time to navigate before retrying.
-        if time.monotonic() - last_click > 30:
-            if clicks >= 2:
-                href = await browser_join_href(zp)
-                if href:
-                    log("Following the 'Join from browser' link target")
+
+        # If we clicked once and 10 seconds passed without entering webclient, try direct /wc/ URL
+        if clicks >= 1 and not tried_direct and time.monotonic() - last_click > 10:
+            tried_direct = True
+            direct_wc = make_web_client_url(last_good or zp.url)
+            if direct_wc:
+                log(f"Opening direct web client URL: {mask_url(direct_wc)}")
+                try:
+                    await zp.goto(direct_wc, wait_until="domcontentloaded")
                     last_click = time.monotonic()
-                    try:
-                        await zp.goto(href, wait_until="domcontentloaded")
-                    except Exception:
-                        pass
                     continue
+                except Exception as e:
+                    log(f"Direct WC goto hiccup ({type(e).__name__})")
+
+        # Try clicking 'Join from your browser'
+        if time.monotonic() - last_click > 15:
             if await click_browser_join(zp):
                 clicks += 1
                 last_click = time.monotonic()
-                log("Clicked 'Join from browser'")
+                log(f"Clicked 'Join from browser' (attempt {clicks})")
+            else:
+                # If button isn't found or already clicked, try direct WC URL
+                if not tried_direct:
+                    tried_direct = True
+                    direct_wc = make_web_client_url(last_good or zp.url)
+                    if direct_wc:
+                        log(f"Opening direct web client URL: {mask_url(direct_wc)}")
+                        try:
+                            await zp.goto(direct_wc, wait_until="domcontentloaded")
+                            last_click = time.monotonic()
+                            continue
+                        except Exception as e:
+                            log(f"Direct WC goto hiccup ({type(e).__name__})")
+
         await asyncio.sleep(1)
     await notify_photo(zp, "⚠️ Zoom web client did not open")
     raise RuntimeError(f"Zoom web client did not open (stuck on {mask_url(zp.url)})")
