@@ -1004,11 +1004,10 @@ async def click_browser_join(zp) -> bool:
             loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
             if await loc.count() and await loc.is_visible():
                 await loc.scroll_into_view_if_needed()
-                await loc.click(force=True, timeout=3000)
                 try:
-                    await loc.evaluate("b => { b.click(); if (b.href && !b.href.startsWith('javascript:')) window.location.href = b.href; }")
+                    await loc.click(timeout=3000)
                 except Exception:
-                    pass
+                    await loc.evaluate("b => { b.click(); if (b.href && !b.href.startsWith('javascript:')) window.location.href = b.href; }")
                 return True
         except Exception:
             continue
@@ -1016,24 +1015,6 @@ async def click_browser_join(zp) -> bool:
 
 
 WC_MEETING_RE = re.compile(r"/wc/(join/)?\d{6,}", re.I)
-
-
-def make_web_client_url(url: str) -> str | None:
-    """Directly converts a meeting/webinar launch URL (/w/ID or /j/ID or /s/ID) to /wc/ID/join."""
-    m = re.search(r"/(?:w|j|s)/(\d+)", url)
-    if not m:
-        return None
-    meeting_id = m.group(1)
-    parsed = urllib.parse.urlparse(url)
-    new_path = f"/wc/{meeting_id}/join"
-    return urllib.parse.urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        new_path,
-        parsed.params,
-        parsed.query,
-        parsed.fragment,
-    ))
 
 
 def is_generic_join_page(zp) -> bool:
@@ -1155,15 +1136,12 @@ async def zoom_signin(zp) -> bool:
 
 async def to_web_client(context, zp):
     """Zoom launch page -> click 'Join from your browser' -> pre-join screen.
-    Guarantees entering the Web Client:
-    1. Clicks 'Join from your browser'
-    2. If page stays on launch screen, opens direct /wc/{meeting_id}/join URL."""
+    Uses the exact portal link with no rewriting."""
     step.record("Zoom Client", "💻", "Zoom launch page: choosing 'Join from your browser'")
     deadline = time.monotonic() + 120
     last_click = 0.0
     clicks = 0
     last_good, reloads, generic_retries = LAST_ZOOM_URL, 0, 0
-    tried_direct = False
 
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
@@ -1171,7 +1149,7 @@ async def to_web_client(context, zp):
             zp = found
             try:
                 await zp.wait_for_load_state("load", timeout=15000)
-                await asyncio.sleep(1.5)  # let Zoom finish its own redirects
+                await asyncio.sleep(2.0)  # let Zoom finish loading the webclient frame
             except Exception:
                 pass
             if is_generic_join_page(zp):
@@ -1209,38 +1187,12 @@ async def to_web_client(context, zp):
         if await on_signin_page(zp):
             return zp  # zoom_prejoin / wait_in_meeting deal with it
 
-        # If we clicked once and 10 seconds passed without entering webclient, try direct /wc/ URL
-        if clicks >= 1 and not tried_direct and time.monotonic() - last_click > 10:
-            tried_direct = True
-            direct_wc = make_web_client_url(last_good or zp.url)
-            if direct_wc:
-                log(f"Opening direct web client URL: {mask_url(direct_wc)}")
-                try:
-                    await zp.goto(direct_wc, wait_until="domcontentloaded")
-                    last_click = time.monotonic()
-                    continue
-                except Exception as e:
-                    log(f"Direct WC goto hiccup ({type(e).__name__})")
-
-        # Try clicking 'Join from your browser'
-        if time.monotonic() - last_click > 15:
+        # Click 'Join from your browser' on the launch page
+        if time.monotonic() - last_click > 20:
             if await click_browser_join(zp):
                 clicks += 1
                 last_click = time.monotonic()
                 log(f"Clicked 'Join from browser' (attempt {clicks})")
-            else:
-                # If button isn't found or already clicked, try direct WC URL
-                if not tried_direct:
-                    tried_direct = True
-                    direct_wc = make_web_client_url(last_good or zp.url)
-                    if direct_wc:
-                        log(f"Opening direct web client URL: {mask_url(direct_wc)}")
-                        try:
-                            await zp.goto(direct_wc, wait_until="domcontentloaded")
-                            last_click = time.monotonic()
-                            continue
-                        except Exception as e:
-                            log(f"Direct WC goto hiccup ({type(e).__name__})")
 
         await asyncio.sleep(1)
     await notify_photo(zp, "⚠️ Zoom web client did not open")
@@ -1267,15 +1219,13 @@ async def click_prejoin_join(zp) -> bool:
                 btn = frame.locator(sel).first
                 if await btn.count() and await btn.is_visible():
                     await btn.scroll_into_view_if_needed()
-                    await btn.click(force=True, timeout=1500)
                     try:
-                        await btn.evaluate("b => { b.click(); if (b.form) b.form.submit(); }")
+                        await btn.click(force=True, timeout=1500)
                     except Exception:
-                        pass
-                    try:
-                        await btn.press("Enter")
-                    except Exception:
-                        pass
+                        try:
+                            await btn.evaluate("b => { b.click(); if (b.form) b.form.submit(); }")
+                        except Exception:
+                            pass
                     log(f"Clicked pre-join button ({sel})")
                     return True
             except Exception:
@@ -1291,11 +1241,13 @@ async def click_prejoin_join(zp) -> bool:
                     box = await b.bounding_box()
                     if box and box["y"] > 250:
                         await b.scroll_into_view_if_needed()
-                        await b.click(force=True, timeout=1500)
                         try:
-                            await b.evaluate("b => b.click()")
+                            await b.click(force=True, timeout=1500)
                         except Exception:
-                            pass
+                            try:
+                                await b.evaluate("b => b.click()")
+                            except Exception:
+                                pass
                         log(f"Clicked pre-join button at y={box['y']:.0f}")
                         return True
         except Exception:

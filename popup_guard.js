@@ -25,13 +25,13 @@
           if (!u) return _open.apply(window, arguments);
           const url = new URL(String(u), location.href);
           if (/^https?:$/.test(url.protocol) &&
-              /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(url.hostname)) {
+            /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(url.hostname)) {
             return _open.apply(window, arguments);
           }
-        } catch (e) {}
+        } catch (e) { }
         return null;
       };
-    } catch (e) {}
+    } catch (e) { }
   }
 
   const CSS =
@@ -50,7 +50,7 @@
       s.id = "__pg_css";
       s.textContent = CSS;
       root.appendChild(s);
-    } catch (e) {}
+    } catch (e) { }
   }
 
   const CONTAINERS = [
@@ -112,7 +112,7 @@
         if (!t && /record/i.test(text)) t = btns.find((b) => CONSENT.test(label(b)));
         if (!t) t = btns.find((b) => CLOSE.test(label(b)) || /(^|[\s_-])close([\s_-]|$)/i.test(cls(b)));
         if (t && !clicked.has(t)) { clicked.add(t); t.click(); n++; }
-      } catch (e) {}
+      } catch (e) { }
     }
     return n;
   }
@@ -128,7 +128,7 @@
   ensureCss();
   try {
     new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
-  } catch (e) {}
+  } catch (e) { }
   setInterval(dismissOnce, 2000);
   document.addEventListener("DOMContentLoaded", () => { ensureCss(); schedule(); });
 })();
