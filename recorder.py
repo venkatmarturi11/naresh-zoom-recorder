@@ -625,7 +625,7 @@ async def _tab_closer(context, portal_url: str, allowed_extra: list[str], zoom_a
                     if now - first_seen.get(id(p), now) < 3:
                         continue
                     url = p.url
-                    if not url or url.startswith(("about:", "chrome://")):
+                    if not url or url.startswith(("about:", "chrome://", "chrome-error://")):
                         continue
                     if _is_zoom_host(url):
                         continue
@@ -649,15 +649,7 @@ async def _tab_closer(context, portal_url: str, allowed_extra: list[str], zoom_a
 # --------------------------------------------------------------------------
 async def login(page) -> None:
     step.record("Portal Login", "🌐", f"Opening portal: {mask_url(PORTAL_URL)}")
-    for attempt in range(1, 3):
-        try:
-            await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
-            break
-        except Exception as e:
-            if attempt == 2:
-                raise
-            log(f"Portal load attempt {attempt} failed ({type(e).__name__}); retrying...")
-            await asyncio.sleep(2)
+    await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
     try:
         pw_field = page.locator(PASS_SEL).first
         await pw_field.wait_for(state="visible", timeout=15000)
@@ -971,6 +963,9 @@ async def wait_and_join(context, page):
     )
 
 
+LAST_ZOOM_URL = ""  # the exact link the portal opened (used only to reload after a browser error)
+
+
 async def click_join(context, page, btn, wait_sec: int = 25):
     known_pages = set(context.pages)
     try:
@@ -984,6 +979,8 @@ async def click_join(context, page, btn, wait_sec: int = 25):
     while time.monotonic() < end:
         for p in context.pages:
             if _is_zoom_host(p.url):
+                global LAST_ZOOM_URL
+                LAST_ZOOM_URL = p.url
                 log(f"Captured Zoom URL: {mask_url(p.url)}")
                 return p
         await asyncio.sleep(0.5)
@@ -1012,6 +1009,14 @@ async def click_browser_join(zp) -> bool:
         except Exception:
             continue
     return False
+
+
+def dismiss_browser_prompt() -> None:
+    """Close Chrome's 'Open xdg-open?' bubble (Cancel is focused) - harmless on the page."""
+    try:
+        sh(["xdotool", "key", "--clearmodifiers", "Escape"], timeout=3)
+    except Exception:
+        pass
 
 
 async def browser_join_href(zp) -> str | None:
@@ -1087,6 +1092,8 @@ async def to_web_client(context, zp):
     deadline = time.monotonic() + 90
     last_click = 0.0
     clicks = 0
+    started = time.monotonic()
+    last_good, reloads = LAST_ZOOM_URL, 0
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
         if found:
@@ -1097,10 +1104,23 @@ async def to_web_client(context, zp):
             if not alive:
                 raise RuntimeError("Zoom tab closed before the web client loaded")
             zp = alive[-1]
+        if zp.url.startswith("chrome-error://") and last_good and reloads < 2:
+            reloads += 1
+            log(f"Zoom tab hit a browser error page; reloading the Zoom page ({reloads}/2)")
+            try:
+                await zp.goto(last_good, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            continue
+        if _is_zoom_host(zp.url):
+            last_good = zp.url
         if await on_signin_page(zp):
             return zp  # zoom_prejoin / wait_in_meeting deal with it
         if await in_meeting(zp):
-            return zp
+            return zp  # skipped the launch page entirely
+        if time.monotonic() - started < 20 and int(time.monotonic() - started) % 3 == 0:
+            dismiss_browser_prompt()
         if time.monotonic() - last_click > 10:
             if clicks >= 2:
                 # clicks did nothing: follow the button's own link target

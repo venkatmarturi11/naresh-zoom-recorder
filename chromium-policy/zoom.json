@@ -1,7 +1,5 @@
 {
-  "URLBlocklist": ["zoommtg://*", "zoomus://*", "zoom://*"],
   "ExternalProtocolDialogShowAlwaysOpenCheckbox": false,
-  "AutoLaunchProtocolsFromOrigins": [],
   "DefaultNotificationsSetting": 2,
   "PasswordManagerEnabled": false,
   "TranslateEnabled": false
