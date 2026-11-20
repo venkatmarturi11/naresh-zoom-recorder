@@ -1107,11 +1107,25 @@ class SigninRequired(RuntimeError):
 async def on_signin_page(zp) -> bool:
     """True when Zoom / an IdP shows a sign-in wall instead of the meeting."""
     try:
-        if SIGNIN_URL_RE.search(zp.url):
+        url = zp.url
+        if SIGNIN_URL_RE.search(url):
             return True
+        text = await page_text(zp)
+        # If we are in the waiting room or already in meeting, it is NOT a sign-in wall
+        if WAITING_ROOM_RE.search(text) or await in_meeting(zp):
+            return False
+        # A real sign-in wall has actual login input fields
+        has_login_input = False
+        for frame in zp.frames:
+            try:
+                if await frame.locator("input#email, input[type='email'], input[type='password']").count() > 0:
+                    has_login_input = True
+                    break
+            except Exception:
+                pass
+        return has_login_input and bool(SIGNIN_TEXT_RE.search(text))
     except Exception:
         return False
-    return bool(SIGNIN_TEXT_RE.search(await page_text(zp)))
 
 
 async def zoom_signin(zp) -> bool:
@@ -1387,7 +1401,7 @@ async def in_meeting(zp) -> bool:
                 return False
         except Exception:
             continue
-    if SIGNIN_TEXT_RE.search(await page_text(zp)):
+    if await on_signin_page(zp):
         return False
     for frame in zp.frames:
         try:
