@@ -238,7 +238,7 @@ step = StepTracker(STEP_SUMMARY_PATH)
 
 def redact(text: str) -> str:
     """Strip secrets from anything that might be logged or sent to Telegram."""
-    for secret in (PORTAL_PASS, TG_BOT_TOKEN, TG_API_HASH):
+    for secret in (PORTAL_PASS, TG_BOT_TOKEN, TG_API_HASH, ZOOM_PASS):
         if secret:
             text = text.replace(secret, "***")
     return text
@@ -465,6 +465,11 @@ class FFmpegRecorder:
 
     def start(self) -> None:
         self._seg_dir.mkdir(parents=True, exist_ok=True)
+        for old in self._seg_dir.glob("seg_*.mkv"):
+            try:
+                old.unlink()
+            except Exception:
+                pass
         self.proc = self._launch()
         time.sleep(2)
         if self.proc.poll() is not None:
@@ -644,7 +649,15 @@ async def _tab_closer(context, portal_url: str, allowed_extra: list[str], zoom_a
 # --------------------------------------------------------------------------
 async def login(page) -> None:
     step.record("Portal Login", "🌐", f"Opening portal: {mask_url(PORTAL_URL)}")
-    await page.goto(PORTAL_URL, wait_until="domcontentloaded")
+    for attempt in range(1, 3):
+        try:
+            await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=45000)
+            break
+        except Exception as e:
+            if attempt == 2:
+                raise
+            log(f"Portal load attempt {attempt} failed ({type(e).__name__}); retrying...")
+            await asyncio.sleep(2)
     try:
         pw_field = page.locator(PASS_SEL).first
         await pw_field.wait_for(state="visible", timeout=15000)
@@ -1050,8 +1063,12 @@ async def zoom_signin(zp) -> bool:
         email = zp.locator("input#email, input[type='email'], input[placeholder*='email' i]").first
         await email.wait_for(state="visible", timeout=5000)
         await email.fill(ZOOM_EMAIL)
-        await zp.get_by_role("button", name=re.compile(r"^next$", re.I)).first.click(timeout=3000)
         pw = zp.locator("input[type='password']").first
+        if not (await pw.count() and await pw.is_visible()):
+            try:
+                await zp.get_by_role("button", name=re.compile(r"^next$", re.I)).first.click(timeout=3000)
+            except Exception:
+                pass
         await pw.wait_for(state="visible", timeout=10000)
         await pw.fill(ZOOM_PASS)
         await pw.press("Enter")
@@ -1082,6 +1099,8 @@ async def to_web_client(context, zp):
             zp = alive[-1]
         if await on_signin_page(zp):
             return zp  # zoom_prejoin / wait_in_meeting deal with it
+        if await in_meeting(zp):
+            return zp
         if time.monotonic() - last_click > 10:
             if clicks >= 2:
                 # clicks did nothing: follow the button's own link target
@@ -1418,15 +1437,21 @@ def probe_duration(path: str) -> float:
         "-of", "csv=p=0", path,
     ]).stdout.strip()
     try:
-        return float(out)
-    except ValueError:
+        val = out.splitlines()[0].strip() if out.splitlines() else ""
+        return float(val)
+    except (ValueError, IndexError):
         return 0.0
 
 
 def make_thumb(path: str) -> str | None:
     thumb = str(Path(path).with_suffix(".jpg"))
     dur = probe_duration(path)
-    seek = "1" if dur < 10 else "10"
+    if dur > 10:
+        seek = "10"
+    elif dur > 1:
+        seek = "1"
+    else:
+        seek = "0"
     res = sh([
         "ffmpeg", "-y", "-ss", seek, "-i", path, "-vframes", "1",
         "-vf", "scale=320:-2", "-q:v", "6", thumb,
@@ -1444,7 +1469,9 @@ def _resplit(part_path: str) -> list[str]:
     seg_time = max(30, int(duration / n_chunks))
     stem = Path(part_path).stem
     out_dir = Path(part_path).parent / f"{stem}_resplit"
-    out_dir.mkdir(exist_ok=True)
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     res = sh([
         "ffmpeg", "-y", "-i", part_path, "-map", "0", "-c", "copy",
         "-f", "segment", "-segment_time", str(seg_time),
@@ -1464,7 +1491,9 @@ def split_file(path: str) -> list[str]:
     avg_rate = size / duration  # bytes per second
     seg_time = max(60, int(TG_SIZE_LIMIT * 0.9 / avg_rate))  # 10% headroom
     out_dir = Path(path).parent / "parts"
-    out_dir.mkdir(exist_ok=True)
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     res = sh([
         "ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy",
         "-f", "segment", "-segment_time", str(seg_time),
