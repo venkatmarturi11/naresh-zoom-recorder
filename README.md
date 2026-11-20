@@ -62,11 +62,20 @@ A dedicated Cloudflare Worker scheduler is deployed for this repo at:
 - **Multi-Class Support:** Set schedules for both **Advance Java** (`18:00` - `19:30`) and **React JS** (`19:30` onwards).
 - **One-Tap Mobile Control:** Open from your phone, sign in with GitHub, toggle schedules, or tap **▶️ Test Run Now**.
 
+## Join flow
+1. Log in to the portal -> 2. open **Live Classes** -> 3. wait until the Join button is
+clickable and click it -> 4. on the Zoom page click **Join from browser** ->
+5. pre-join screen: name, mic muted, video off, **Join** -> 6. record until the
+meeting ends or `MAX_MEETING_SEC`. If Zoom shows a sign-in page instead, a screenshot is
+sent to Telegram and nothing is recorded (optional `ZOOM_EMAIL` / `ZOOM_PASS` secrets).
+
 ## Popup protection (Chrome + Zoom)
 - **Extra tabs/windows**: any tab that is not the portal or Zoom is closed within 1 s;
   once Zoom opens, it is the only tab allowed (and is brought to front).
-- **Zoom pages**: `window.open()` is disabled, downloads are refused, and the
-  "Open Zoom Meetings?" app prompt is avoided by using the web client directly.
+- **Zoom pages**: `window.open()` is allowed only for Zoom's own https pages (so
+  "Join from browser" works); `zoommtg://` launches and foreign popups are blocked.
+  The "Open xdg-open?" app prompt is suppressed by a Chromium policy
+  (`chromium-policy/zoom.json`). Zoom links are never rewritten.
 - **Browser prompts**: notifications, mic/camera, password-save, translate,
   crash bubbles and similar Chrome bubbles are disabled; JS alert/confirm dialogs are auto-handled.
 - **In-page popups**: cookie banners, "Got it", "Not now", recording notice,

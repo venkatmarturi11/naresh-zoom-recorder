@@ -60,6 +60,8 @@ jobs:
           USER_SELECTOR: ${{ vars.USER_SELECTOR || secrets.USER_SELECTOR }}
           PASS_SELECTOR: ${{ vars.PASS_SELECTOR || secrets.PASS_SELECTOR }}
           PARTICIPANT_NAME: ${{ vars.PARTICIPANT_NAME }}
+          ZOOM_EMAIL: ${{ secrets.ZOOM_EMAIL }}
+          ZOOM_PASS: ${{ secrets.ZOOM_PASS }}
           MAX_WAIT_MIN: ${{ vars.MAX_WAIT_MIN }}
           MAX_MEETING_SEC: ${{ vars.MAX_MEETING_SEC }}
           ALLOWED_HOSTS: ${{ vars.ALLOWED_HOSTS }}
@@ -74,7 +76,7 @@ jobs:
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
             -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
-            -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME \
+            -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME -e ZOOM_EMAIL -e ZOOM_PASS \
             -e MAX_WAIT_MIN -e MAX_MEETING_SEC -e ALLOWED_HOSTS -e BLOCK_TRACKERS \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
 

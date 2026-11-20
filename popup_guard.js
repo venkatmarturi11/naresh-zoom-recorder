@@ -1,7 +1,7 @@
 /* Popup guard: injected into EVERY page and iframe (portal + Zoom web client)
  * via Playwright's add_init_script.
  *  - hides cookie banners / consent overlays immediately
- *  - blocks window.open() inside Zoom pages (marketing / survey popups)
+ *  - blocks window.open() to non-Zoom / zoommtg:// targets inside Zoom pages
  *  - auto-dismisses harmless dialogs, toasts and banners ("Got it", "Not now",
  *    cookie accept, recording notice, "Stay muted", ...)
  *  - NEVER touches dialogs that contain input fields, passcode/name prompts,
@@ -16,7 +16,22 @@
   const isZoom = /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(host);
 
   if (isZoom) {
-    try { window.open = function () { return null; }; } catch (e) {}
+    // Block the desktop-app launcher (zoommtg://) and foreign popups, but let
+    // Zoom's own navigation through - the "Join from browser" button relies on it.
+    try {
+      const _open = window.open;
+      window.open = function (u) {
+        try {
+          if (!u) return null;
+          const url = new URL(String(u), location.href);
+          if (/^https?:$/.test(url.protocol) &&
+              /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(url.hostname)) {
+            return _open.apply(window, arguments);
+          }
+        } catch (e) {}
+        return null;
+      };
+    } catch (e) {}
   }
 
   const CSS =

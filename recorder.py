@@ -150,6 +150,16 @@ WAITING_ROOM_RE = re.compile(
     re.I,
 )
 POST_MEETING_URL_RE = re.compile(r"(postattendee|/wc/leave|/leave\b|/meeting/end)", re.I)
+# Zoom (or an identity provider) asking for a login instead of letting us in
+SIGNIN_URL_RE = re.compile(
+    r"(/signin|/google_oauth|accounts\.google|facebook\.com|appleid\.apple|"
+    r"login\.microsoftonline|/saml|/sso|/meeting/register)", re.I)
+SIGNIN_TEXT_RE = re.compile(
+    r"(sign in to (join|continue|zoom)|sign in with (apple|google|facebook|sso|microsoft)|"
+    r"authorized attendees|only authenticated users|authenticated users can join|"
+    r"enter email, zoom mail or phone number)", re.I)
+ZOOM_EMAIL = _env("ZOOM_EMAIL")
+ZOOM_PASS = _env("ZOOM_PASS")
 
 HIDE_CSS = """
 * { cursor: none !important; }
@@ -991,6 +1001,23 @@ async def click_browser_join(zp) -> bool:
     return False
 
 
+async def browser_join_href(zp) -> str | None:
+    """The 'Join from browser' button's own destination (not a rewrite)."""
+    pat = re.compile(r"join from (your )?browser", re.I)
+    for frame in zp.frames:
+        try:
+            loc = frame.locator("a[href]").filter(has_text=pat).first
+            if await loc.count():
+                href = await loc.get_attribute("href") or ""
+                if href.startswith("/"):
+                    href = urllib.parse.urljoin(zp.url, href)
+                if href.startswith("http") and _is_zoom_host(href):
+                    return href
+        except Exception:
+            continue
+    return None
+
+
 async def _has_webclient(context, zp):
     for p in context.pages:
         if "/wc/" in p.url:
@@ -1001,41 +1028,79 @@ async def _has_webclient(context, zp):
     return None
 
 
-async def to_web_client(context, zp):
-    step.record("Zoom Client", "💻", "Navigating to Zoom in-browser Web Client")
-    found = await _has_webclient(context, zp)
-    if found:
-        log(f"Web client active: {mask_url(found.url)}")
-        return found
+class SigninRequired(RuntimeError):
+    pass
 
-    clicked_browser = False
-    for _ in range(30):
+
+async def on_signin_page(zp) -> bool:
+    """True when Zoom / an IdP shows a sign-in wall instead of the meeting."""
+    try:
+        if SIGNIN_URL_RE.search(zp.url):
+            return True
+    except Exception:
+        return False
+    return bool(SIGNIN_TEXT_RE.search(await page_text(zp)))
+
+
+async def zoom_signin(zp) -> bool:
+    """Optional: sign in with a dedicated Zoom account (ZOOM_EMAIL / ZOOM_PASS)."""
+    if not (ZOOM_EMAIL and ZOOM_PASS):
+        return False
+    try:
+        email = zp.locator("input#email, input[type='email'], input[placeholder*='email' i]").first
+        await email.wait_for(state="visible", timeout=5000)
+        await email.fill(ZOOM_EMAIL)
+        await zp.get_by_role("button", name=re.compile(r"^next$", re.I)).first.click(timeout=3000)
+        pw = zp.locator("input[type='password']").first
+        await pw.wait_for(state="visible", timeout=10000)
+        await pw.fill(ZOOM_PASS)
+        await pw.press("Enter")
+        log("Submitted Zoom sign-in form")
+        await asyncio.sleep(5)
+        return True
+    except Exception as e:
+        log(f"Zoom sign-in attempt failed ({type(e).__name__})")
+        return False
+
+
+async def to_web_client(context, zp):
+    """Zoom launch page -> click 'Join from your browser' -> pre-join screen.
+    Exactly what a person does; the link is never rewritten."""
+    step.record("Zoom Client", "💻", "Zoom launch page: choosing 'Join from your browser'")
+    deadline = time.monotonic() + 90
+    last_click = 0.0
+    clicks = 0
+    while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
         if found:
             log(f"Web client active: {mask_url(found.url)}")
             return found
-        if not clicked_browser and await click_browser_join(zp):
-            clicked_browser = True
-            log("Clicked 'Join from browser'")
-            end = time.monotonic() + 20
-            while time.monotonic() < end:
-                found = await _has_webclient(context, zp)
-                if found:
-                    log(f"Web client loaded: {mask_url(found.url)}")
-                    return found
-                if await in_meeting(zp):
-                    return zp
-                await asyncio.sleep(0.5)
-            break
-        await asyncio.sleep(0.5)
-
-    if re.search(r"/(j|w)/", zp.url):
-        new_url = re.sub(r"/(j|w)/", "/wc/join/", zp.url, count=1)
-        log("Rewriting Zoom link to the web client")
-        await zp.goto(new_url, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        log(f"After rewrite URL: {mask_url(zp.url)}")
-    return zp
+        if zp.is_closed():
+            alive = [p for p in context.pages if _is_zoom_host(p.url)]
+            if not alive:
+                raise RuntimeError("Zoom tab closed before the web client loaded")
+            zp = alive[-1]
+        if await on_signin_page(zp):
+            return zp  # zoom_prejoin / wait_in_meeting deal with it
+        if time.monotonic() - last_click > 10:
+            if clicks >= 2:
+                # clicks did nothing: follow the button's own link target
+                href = await browser_join_href(zp)
+                if href:
+                    log("Following the 'Join from browser' link target")
+                    last_click = time.monotonic()
+                    try:
+                        await zp.goto(href, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
+                    continue
+            if await click_browser_join(zp):
+                clicks += 1
+                last_click = time.monotonic()
+                log("Clicked 'Join from browser'")
+        await asyncio.sleep(1)
+    await notify_photo(zp, "⚠️ Zoom web client did not open")
+    raise RuntimeError(f"Zoom web client did not open (stuck on {mask_url(zp.url)})")
 
 
 async def ensure_muted(zp) -> None:
@@ -1100,6 +1165,8 @@ async def zoom_prejoin(zp) -> None:
         if await in_meeting(zp):
             clicked_join = True
             break
+        if await on_signin_page(zp):
+            break  # wait_in_meeting reports / handles it
         await click_browser_join(zp)
         await dismiss_popups(zp)
         await ensure_muted(zp)
@@ -1171,9 +1238,21 @@ async def dismiss_popups(zp) -> None:
 
 async def in_meeting(zp) -> bool:
     try:
+        if not _is_zoom_host(zp.url) or SIGNIN_URL_RE.search(zp.url):
+            return False
         await zp.mouse.move(960, 1040)
     except Exception:
         pass
+    # still on the pre-join screen -> not in the meeting yet
+    for frame in zp.frames:
+        try:
+            pj = frame.locator("button.preview-join-button, input#input-for-name").first
+            if await pj.count() and await pj.is_visible():
+                return False
+        except Exception:
+            continue
+    if SIGNIN_TEXT_RE.search(await page_text(zp)):
+        return False
     for frame in zp.frames:
         try:
             loc = frame.locator(
@@ -1190,19 +1269,36 @@ async def in_meeting(zp) -> bool:
 
 
 async def wait_in_meeting(zp, max_wait: int = 300) -> None:
-    """Wait through the waiting room; start recording only once inside."""
+    """Wait through the waiting room; start recording only once truly inside."""
     deadline = time.monotonic() + max_wait
     started_wait = time.monotonic()
     last_diag = -60.0
     sent_debug = False
+    signin_tries = 0
+    stable = 0
     while time.monotonic() < deadline:
         text = await page_text(zp)
         if END_RE.search(text):
             raise RuntimeError("Meeting ended before the recording could start")
+        if await on_signin_page(zp):
+            stable = 0
+            await notify_photo(zp, "🔐 Zoom is asking for sign-in")
+            if signin_tries < 2 and await zoom_signin(zp):
+                signin_tries += 1
+                continue
+            raise SigninRequired(
+                "Zoom asked for sign-in and the meeting could not be joined as a guest. "
+                "Set ZOOM_EMAIL / ZOOM_PASS (a Zoom account) to join automatically."
+            )
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
-            step.record("Meeting Status", "🎥", "Confirmed inside Zoom meeting! Ready to record")
-            return
+            stable += 1
+            if stable >= 2:  # must hold for two consecutive checks
+                step.record("Meeting Status", "🎥", "Confirmed inside Zoom meeting! Ready to record")
+                return
+            await asyncio.sleep(1.5)
+            continue
+        stable = 0
         elapsed = time.monotonic() - started_wait
         if elapsed - last_diag >= 30:
             last_diag = elapsed
@@ -1211,11 +1307,12 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if not sent_debug and elapsed >= 30:
             sent_debug = True
             await notify_photo(zp, f"⏳ Waiting to enter Zoom ({mask_url(zp.url)})")
-        # If still stuck on the pre-join screen, retry clicking the real pre-join button
+        # Still on the pre-join screen? press Join again.
         if elapsed >= 4 and not WAITING_ROOM_RE.search(text) and int(elapsed) % 5 < 2:
             await click_prejoin_join(zp)
         await asyncio.sleep(2)
-    step.record("Meeting Status", "⚠️", "Could not confirm meeting UI; starting recording anyway")
+    await notify_photo(zp, "⚠️ Could not confirm the meeting UI")
+    raise RuntimeError("Could not confirm that the Zoom meeting was joined; not recording")
 
 
 async def join_audio(zp) -> None:
@@ -1288,6 +1385,8 @@ async def monitor(zp, started: float) -> str:
         url = zp.url
         if "zoom." not in url or POST_MEETING_URL_RE.search(url):
             return "redirected away from the meeting"
+        if SIGNIN_URL_RE.search(url):
+            return "kicked to the Zoom sign-in page"
         try:
             text = await page_text(zp)
             failures = 0
@@ -1554,6 +1653,7 @@ async def main() -> int:
                 await zoom_prejoin(zoom_page)
                 await wait_in_meeting(zoom_page)
                 await join_audio(zoom_page)
+                await notify_photo(zoom_page, "📸 Joined the meeting - recording starts now")
 
                 recorder.start()
                 started = time.monotonic()

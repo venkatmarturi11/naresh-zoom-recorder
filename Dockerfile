@@ -26,6 +26,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && (pip install --no-cache-dir tgcrypto==1.2.5 || echo 'tgcrypto skipped (uploads still work, just slower)')
 
+# Chromium policy: never show the "Open xdg-open?" / "Open Zoom Meetings?" prompt
+RUN mkdir -p /etc/chromium/policies/managed /etc/opt/chrome/policies/managed
+COPY chromium-policy/zoom.json /etc/chromium/policies/managed/zoom.json
+COPY chromium-policy/zoom.json /etc/opt/chrome/policies/managed/zoom.json
+
 COPY recorder.py popup_guard.js ./
 RUN chown -R pwuser:pwuser /app
 
