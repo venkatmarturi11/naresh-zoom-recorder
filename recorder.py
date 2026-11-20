@@ -1011,6 +1011,38 @@ async def click_browser_join(zp) -> bool:
     return False
 
 
+WC_MEETING_RE = re.compile(r"/wc/(join/)?\d{6,}", re.I)
+
+
+def is_generic_join_page(zp) -> bool:
+    """Zoom's blank 'Join Meeting / Meeting ID' page: the meeting link was not accepted."""
+    try:
+        u = urllib.parse.urlparse(zp.url)
+        return u.hostname is not None and _is_zoom_host(zp.url) and \
+            u.path.rstrip("/") in ("/wc", "/wc/join", "/join") and not WC_MEETING_RE.search(u.path)
+    except Exception:
+        return False
+
+
+async def is_real_prejoin(zp) -> bool:
+    """True only on the pre-join screen of an actual meeting."""
+    if is_generic_join_page(zp) or not _is_zoom_host(zp.url):
+        return False
+    try:
+        if WC_MEETING_RE.search(urllib.parse.urlparse(zp.url).path):
+            return True
+    except Exception:
+        pass
+    for frame in zp.frames:
+        try:
+            b = frame.locator("button.preview-join-button, input#input-for-name").first
+            if await b.count() and await b.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def dismiss_browser_prompt() -> None:
     """Close Chrome's 'Open xdg-open?' bubble (Cancel is focused) - harmless on the page."""
     try:
@@ -1087,18 +1119,37 @@ async def zoom_signin(zp) -> bool:
 
 async def to_web_client(context, zp):
     """Zoom launch page -> click 'Join from your browser' -> pre-join screen.
-    Exactly what a person does; the link is never rewritten."""
+    Exactly what a person does: ONE click (the link's tk token is single-use),
+    no Escape key (it would abort the loading page), the link is never rewritten."""
     step.record("Zoom Client", "💻", "Zoom launch page: choosing 'Join from your browser'")
-    deadline = time.monotonic() + 90
+    deadline = time.monotonic() + 120
     last_click = 0.0
     clicks = 0
-    started = time.monotonic()
-    last_good, reloads = LAST_ZOOM_URL, 0
+    last_good, reloads, generic_retries = LAST_ZOOM_URL, 0, 0
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
         if found:
-            log(f"Web client active: {mask_url(found.url)}")
-            return found
+            zp = found
+            try:
+                await zp.wait_for_load_state("load", timeout=15000)
+                await asyncio.sleep(1.5)  # let Zoom finish its own redirects
+            except Exception:
+                pass
+            if is_generic_join_page(zp):
+                if generic_retries < 1 and last_good:
+                    generic_retries += 1
+                    log("Zoom showed its generic 'Join Meeting' page; reopening the portal's Zoom page once")
+                    try:
+                        await zp.goto(last_good, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
+                    clicks, last_click = 0, 0.0
+                    continue
+                await notify_photo(zp, "⚠️ Zoom dropped to the generic Join Meeting page")
+                raise RuntimeError("Zoom did not accept the meeting link (generic Join Meeting page)")
+            log(f"Web client active: {mask_url(zp.url)}")
+            dismiss_browser_prompt()  # page is fully loaded now, so Escape is safe
+            return zp
         if zp.is_closed():
             alive = [p for p in context.pages if _is_zoom_host(p.url)]
             if not alive:
@@ -1111,19 +1162,16 @@ async def to_web_client(context, zp):
                 await zp.goto(last_good, wait_until="domcontentloaded")
             except Exception:
                 pass
+            clicks, last_click = 0, 0.0
             await asyncio.sleep(1)
             continue
         if _is_zoom_host(zp.url):
             last_good = zp.url
         if await on_signin_page(zp):
             return zp  # zoom_prejoin / wait_in_meeting deal with it
-        if await in_meeting(zp):
-            return zp  # skipped the launch page entirely
-        if time.monotonic() - started < 20 and int(time.monotonic() - started) % 3 == 0:
-            dismiss_browser_prompt()
-        if time.monotonic() - last_click > 10:
+        # Click once, then give Zoom plenty of time to navigate before retrying.
+        if time.monotonic() - last_click > 30:
             if clicks >= 2:
-                # clicks did nothing: follow the button's own link target
                 href = await browser_join_href(zp)
                 if href:
                     log("Following the 'Join from browser' link target")
@@ -1148,6 +1196,8 @@ async def ensure_muted(zp) -> None:
 
 
 async def click_prejoin_join(zp) -> bool:
+    if not await is_real_prejoin(zp):
+        return False
     for frame in zp.frames:
         for sel in [
             "button.preview-join-button",
@@ -1206,7 +1256,11 @@ async def zoom_prejoin(zp) -> None:
             break
         if await on_signin_page(zp):
             break  # wait_in_meeting reports / handles it
-        await click_browser_join(zp)
+        if is_generic_join_page(zp):
+            break  # wait_in_meeting reports it
+        if not await is_real_prejoin(zp):
+            await asyncio.sleep(1)
+            continue
         await dismiss_popups(zp)
         await ensure_muted(zp)
 
@@ -1319,6 +1373,9 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         text = await page_text(zp)
         if END_RE.search(text):
             raise RuntimeError("Meeting ended before the recording could start")
+        if is_generic_join_page(zp):
+            await notify_photo(zp, "⚠️ Zoom dropped to the generic Join Meeting page")
+            raise RuntimeError("Zoom did not accept the meeting link (generic Join Meeting page)")
         if await on_signin_page(zp):
             stable = 0
             await notify_photo(zp, "🔐 Zoom is asking for sign-in")
@@ -1702,6 +1759,7 @@ async def main() -> int:
                 await zoom_prejoin(zoom_page)
                 await wait_in_meeting(zoom_page)
                 await join_audio(zoom_page)
+                dismiss_browser_prompt()
                 await notify_photo(zoom_page, "📸 Joined the meeting - recording starts now")
 
                 recorder.start()
