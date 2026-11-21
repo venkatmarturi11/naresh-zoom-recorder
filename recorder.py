@@ -302,6 +302,71 @@ def _is_zoom_host(url: str) -> bool:
         return False
 
 
+# The first Zoom link that carried a real meeting id (e.g. /j/123456789?pwd=...).
+# Zoom may redirect that link to a sign-in page, so we remember the original
+# and can rebuild a direct web-client URL from it.
+MEETING_URL = ""
+
+
+def make_web_client_urls(url: str) -> list[str]:
+    """Direct web-client links for a meeting/webinar link (every parameter kept,
+    including the personal tk token). Tried in order; the fragment (#success) is dropped."""
+    try:
+        if not url or not _is_zoom_host(url):
+            return []
+        u = urllib.parse.urlparse(url)
+        m = re.search(r"/(\d{9,12})(?:[/?#]|$)", u.path)
+        if not m:
+            return []
+        mid = m.group(1)
+        base = re.search(r"(zoom(?:gov)?\.(?:us|com|cn))$", u.hostname or "", re.I)
+        root = (base.group(1) if base else "zoom.us").lower()
+        q = ("?" + u.query) if u.query else ""
+        q_launch = "?ref_from=launch" + ("&" + u.query if u.query else "")
+        return [
+            f"https://app.{root}/wc/{mid}/join{q_launch}",  # what the real button opens
+            f"https://app.{root}/wc/{mid}/join{q}",
+            f"https://{u.hostname}/wc/{mid}/join{q}",
+            f"https://{u.hostname}/wc/join/{mid}{q}",
+            f"https://{root}/wc/{mid}/join{q}",
+        ]
+    except Exception:
+        return []
+
+
+def make_web_client_url(url: str) -> str | None:
+    urls = make_web_client_urls(url)
+    return urls[0] if urls else None
+
+
+NAV_LOG: list[str] = []
+
+
+def note_navigation(url: str) -> None:
+    """Record host + path + parameter NAMES (never values) of Zoom/portal hops, for diagnostics."""
+    try:
+        u = urllib.parse.urlparse(url)
+        if not u.hostname or u.scheme not in ("http", "https"):
+            return
+        keys = ",".join(sorted(urllib.parse.parse_qs(u.query).keys()))
+        entry = f"{u.hostname}{re.sub(r'\d{6,}', '<id>', u.path)}" + (f" ?{keys}" if keys else "")
+        if not NAV_LOG or NAV_LOG[-1] != entry:
+            NAV_LOG.append(entry)
+            del NAV_LOG[:-12]
+    except Exception:
+        pass
+
+
+def remember_meeting_url(url: str) -> None:
+    """Keep the first (or the first password-carrying) real meeting link we see."""
+    global MEETING_URL
+    if not url or SIGNIN_URL_RE.search(url) or make_web_client_url(url) is None:
+        return
+    if not MEETING_URL or (len(url) > len(MEETING_URL) and ("tk=" in url or "pwd=" in url)):
+        MEETING_URL = url
+        log(f"Remembered meeting link: {mask_url(url)}")
+
+
 # --------------------------------------------------------------------------
 # Telegram notifications (plain Bot API, independent of Pyrogram)
 # --------------------------------------------------------------------------
@@ -573,7 +638,8 @@ async def page_text(page) -> str:
     chunks = []
     for frame in page.frames:
         try:
-            chunks.append(await frame.evaluate("document.body ? document.body.innerText : ''"))
+            chunks.append(await asyncio.wait_for(
+                frame.evaluate("document.body ? document.body.innerText : ''"), 5))
         except Exception:
             continue
     return "\n".join(chunks)
@@ -968,6 +1034,10 @@ LAST_ZOOM_URL = ""  # the exact link the portal opened (used only to reload afte
 
 async def click_join(context, page, btn, wait_sec: int = 25):
     known_pages = set(context.pages)
+    try:  # the portal button's own link is the best source of the meeting id/password
+        remember_meeting_url(await btn.get_attribute("href") or "")
+    except Exception:
+        pass
     try:
         async with context.expect_page(timeout=6000) as new_page_info:
             await btn.click()
@@ -1001,13 +1071,13 @@ async def click_browser_join(zp) -> bool:
     pat = re.compile(r"join from (your )?browser", re.I)
     for frame in zp.frames:
         try:
-            loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
-            if await loc.count() and await loc.is_visible():
+            loc = frame.locator("a, button, [role='button'], span, div").filter(has_text=pat).first
+            if await asyncio.wait_for(loc.count(), 5) and await asyncio.wait_for(loc.is_visible(), 5):
                 await loc.scroll_into_view_if_needed()
                 try:
-                    await loc.click(timeout=3000)
+                    await loc.click(force=True, timeout=3000)
                 except Exception:
-                    await loc.evaluate("b => { b.click(); if (b.href && !b.href.startsWith('javascript:')) window.location.href = b.href; }")
+                    await loc.evaluate("b => { b.click(); const a = b.closest('a'); if (a && a.href && !a.href.startsWith('javascript:')) window.location.href = a.href; }")
                 return True
         except Exception:
             continue
@@ -1073,12 +1143,47 @@ async def browser_join_href(zp) -> str | None:
 
 async def _has_webclient(context, zp):
     for p in context.pages:
+        if SIGNIN_URL_RE.search(p.url):
+            continue  # a sign-in URL can carry "/wc/..." in its query string
         if "/wc/" in p.url and not is_generic_join_page(p):
             return p
         for f in p.frames:
-            if "/wc/" in f.url and not is_generic_join_page(p):
+            if "/wc/" in f.url and not SIGNIN_URL_RE.search(f.url) and not is_generic_join_page(p):
                 return p
     return None
+
+
+async def recover_from_signin(zp, attempt: int) -> bool:
+    """Zoom redirected us to a sign-in page. Retry, in order:
+    0) the exact link the portal gave us (personal token intact),
+    1) the same link rewritten to the direct web client (all parameters kept),
+    2) a Zoom account login (ZOOM_EMAIL / ZOOM_PASS), then back to the meeting.
+    Returns True when it navigated somewhere new and the caller should re-check."""
+    original = MEETING_URL or LAST_ZOOM_URL
+    direct = make_web_client_urls(original)
+    if not original:
+        log("Sign-in page shown, but no meeting link was captured to retry with")
+        return False
+    try:
+        if attempt == 0:
+            step.record("Zoom Sign-in", "🔁", "Zoom showed sign-in; reopening the portal's exact meeting link")
+            await zp.goto(original, wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            return True
+        if attempt in (1, 2, 3) and len(direct) >= attempt:
+            step.record("Zoom Sign-in", "🔁", f"Still sign-in; trying direct web client link #{attempt} (all parameters kept)")
+            await zp.goto(direct[attempt - 1], wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            return True
+        if attempt == 4 and ZOOM_EMAIL and ZOOM_PASS and direct:
+            step.record("Zoom Sign-in", "🔑", "Signing in with the configured Zoom account")
+            if await zoom_signin(zp):
+                await zp.goto(direct[0], wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                return True
+    except Exception as e:
+        log(f"Sign-in recovery hiccup ({type(e).__name__})")
+    return False
 
 
 class SigninRequired(RuntimeError):
@@ -1136,12 +1241,27 @@ async def zoom_signin(zp) -> bool:
 
 async def to_web_client(context, zp):
     """Zoom launch page -> click 'Join from your browser' -> pre-join screen.
-    Uses the exact portal link with no rewriting."""
-    step.record("Zoom Client", "💻", "Zoom launch page: choosing 'Join from your browser'")
-    deadline = time.monotonic() + 120
+    Guarantees entering the Web Client:
+    1. Clicks 'Join from your browser'
+    2. If page stays on launch screen, opens direct /wc/{meeting_id}/join URL."""
+    step.record("Zoom Client", "💻", "Zoom launch page reached; opening the browser web client directly")
+    deadline = time.monotonic() + 150
     last_click = 0.0
     clicks = 0
     last_good, reloads, generic_retries = LAST_ZOOM_URL, 0, 0
+    signin_recoveries = 0
+
+    # The launch page can stop responding once it tries to open the desktop app, so
+    # do what the real "Join from browser" button does: open the web-client URL
+    # (same tk / pwd) ourselves, without clicking anything first.
+    dismiss_browser_prompt()
+    candidates = [u for u in (MEETING_URL, LAST_ZOOM_URL, zp.url)
+                  if u and not SIGNIN_URL_RE.search(u) and make_web_client_urls(u)]
+    source = max(candidates, key=lambda u: len(urllib.parse.urlparse(u).query), default="")
+    direct = make_web_client_urls(source)
+    log(f"Direct web client candidates: {len(direct)} (link has token: {'tk=' in source})")
+    di = 0
+    tried_newtab = False
 
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
@@ -1185,17 +1305,65 @@ async def to_web_client(context, zp):
         if _is_zoom_host(zp.url):
             last_good = zp.url
         if await on_signin_page(zp):
-            return zp  # zoom_prejoin / wait_in_meeting deal with it
+            if signin_recoveries < 5 and await recover_from_signin(zp, signin_recoveries):
+                signin_recoveries += 1
+                clicks, last_click = 0, 0.0
+                continue
+            return zp  # nothing left to try: wait_in_meeting reports it
 
-        # Click 'Join from your browser' on the launch page
-        if time.monotonic() - last_click > 20:
-            if await click_browser_join(zp):
-                clicks += 1
-                last_click = time.monotonic()
-                log(f"Clicked 'Join from browser' (attempt {clicks})")
+        # Open the direct web-client link(s) first (a new one every 15 s if nothing loads)
+        if di < len(direct) and time.monotonic() - last_click > (0 if di == 0 else 15):
+            target = direct[di]
+            di += 1
+            log(f"Opening direct web client URL #{di}: {mask_url(target)}")
+            try:
+                await zp.goto(target, wait_until="commit", timeout=15000)
+            except Exception as e:
+                log(f"Direct web client goto hiccup ({type(e).__name__})")
+            last_click = time.monotonic()
+            await asyncio.sleep(4)
+            log(f"After direct goto #{di} the tab is at: {mask_url(zp.url)} | hops: {' > '.join(NAV_LOG[-4:])}")
+            continue
+
+        # One clean attempt in a brand-new tab (the launch page's own scripts can interfere)
+        if di >= len(direct) and not tried_newtab and direct:
+            tried_newtab = True
+            log("Trying the direct web client link in a fresh tab")
+            try:
+                np_ = await context.new_page()
+                await np_.goto(direct[0], wait_until="commit", timeout=15000)
+                await asyncio.sleep(4)
+                log(f"Fresh tab is at: {mask_url(np_.url)}")
+            except Exception as e:
+                log(f"Fresh tab hiccup ({type(e).__name__})")
+            last_click = time.monotonic()
+            continue
+
+        # Last resort: click 'Join from browser' (bounded so it can never stall the run)
+        if di >= len(direct) and time.monotonic() - last_click > 15:
+            try:
+                if await asyncio.wait_for(click_browser_join(zp), 20):
+                    clicks += 1
+                    log(f"Clicked 'Join from browser' (attempt {clicks})")
+            except Exception as e:
+                log(f"'Join from browser' click hiccup ({type(e).__name__})")
+            last_click = time.monotonic()
 
         await asyncio.sleep(1)
-    await notify_photo(zp, "⚠️ Zoom web client did not open")
+    try:
+        btns = []
+        for fr in zp.frames:
+            btns += [t.strip() for t in await asyncio.wait_for(
+                fr.locator("a, button, [role='button']").all_inner_texts(), 5) if t.strip()]
+        seen = re.sub(r"\s+", " ", (await page_text(zp))).strip()[:200]
+    except Exception:
+        btns, seen = [], ""
+    await notify_photo(
+        zp,
+        "⚠️ Zoom web client did not open\n"
+        f"Tabs: {len(context.pages)} | Hops (values hidden):\n" + "\n".join(NAV_LOG[-8:]) +
+        f"\nButtons: {btns[:6]}\nText: {seen}",
+    )
     raise RuntimeError(f"Zoom web client did not open (stuck on {mask_url(zp.url)})")
 
 
@@ -1342,7 +1510,7 @@ async def in_meeting(zp) -> bool:
     try:
         if not _is_zoom_host(zp.url) or SIGNIN_URL_RE.search(zp.url):
             return False
-        await zp.mouse.move(960, 1040)
+        await asyncio.wait_for(zp.mouse.move(960, 1040), 3)
     except Exception:
         pass
     # still on the pre-join screen -> not in the meeting yet
@@ -1387,12 +1555,20 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
             raise RuntimeError("Zoom did not accept the meeting link (generic Join Meeting page)")
         if await on_signin_page(zp):
             stable = 0
-            await notify_photo(zp, "🔐 Zoom is asking for sign-in")
+            await notify_photo(zp, "🔐 Zoom is asking for sign-in\nRedirect chain (values hidden):\n" + "\n".join(NAV_LOG[-8:]))
             if signin_tries < 2 and await zoom_signin(zp):
                 signin_tries += 1
+                target = make_web_client_url(MEETING_URL or LAST_ZOOM_URL)
+                if target:  # after login Zoom lands on the profile page; go back to the meeting
+                    try:
+                        await zp.goto(target, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
                 continue
+            log(f"Sign-in wall at {mask_url(zp.url)} (meeting link captured: {bool(MEETING_URL)})")
             raise SigninRequired(
-                "Zoom asked for sign-in and the meeting could not be joined as a guest. "
+                "Zoom asked for sign-in and the meeting could not be joined as a guest "
+                "(the host may have enabled 'Only authenticated users can join'). "
                 "Set ZOOM_EMAIL / ZOOM_PASS (a Zoom account) to join automatically."
             )
         await dismiss_popups(zp)
@@ -1669,6 +1845,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
+        log("Recorder build 2026-11-21c (direct web client + bounded page calls)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -1741,6 +1918,16 @@ async def main() -> int:
             def _attach_page_handlers(p):
                 p.on("dialog", lambda d: asyncio.create_task(_dismiss_dialog(d)))
                 p.on("download", lambda dl: asyncio.create_task(_cancel_download(dl)))
+
+                def _on_request(req):
+                    try:
+                        if req.is_navigation_request():
+                            note_navigation(req.url)
+                            remember_meeting_url(req.url)
+                    except Exception:
+                        pass
+
+                p.on("request", _on_request)
 
             context.on("page", _attach_page_handlers)
             for p in context.pages:
