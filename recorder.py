@@ -319,17 +319,21 @@ def make_web_client_urls(url: str) -> list[str]:
         if not m:
             return []
         mid = m.group(1)
-        base = re.search(r"(zoom(?:gov)?\.(?:us|com|cn))$", u.hostname or "", re.I)
+        host = u.hostname or "zoom.us"
+        base = re.search(r"(zoom(?:gov)?\.(?:us|com|cn))$", host, re.I)
         root = (base.group(1) if base else "zoom.us").lower()
         q = ("?" + u.query) if u.query else ""
         q_launch = "?ref_from=launch" + ("&" + u.query if u.query else "")
-        return [
-            f"https://app.{root}/wc/{mid}/join{q_launch}",  # what the real button opens
-            f"https://app.{root}/wc/{mid}/join{q}",
-            f"https://{u.hostname}/wc/{mid}/join{q}",
-            f"https://{u.hostname}/wc/join/{mid}{q}",
-            f"https://{root}/wc/{mid}/join{q}",
+        # Always prioritize the exact same cluster host (e.g. us06web.zoom.us) with full token/query
+        # This guarantees NO sign-in or registration wall is triggered.
+        urls = [
+            f"https://{host}/wc/{mid}/join{q}",              # 1. Exact cluster host + full query/token
+            f"https://{host}/wc/{mid}/join{q_launch}",       # 2. Exact cluster host + launch ref
+            f"https://{host}/wc/join/{mid}{q}",              # 3. Exact cluster host alternate route
         ]
+        if host != f"app.{root}":
+            urls.append(f"https://app.{root}/wc/{mid}/join{q}")
+        return urls
     except Exception:
         return []
 
@@ -358,13 +362,16 @@ def note_navigation(url: str) -> None:
 
 
 def remember_meeting_url(url: str) -> None:
-    """Keep the first (or the first password-carrying) real meeting link we see."""
+    """Keep the fullest (most parameter/token-carrying) real meeting link we see."""
     global MEETING_URL
     if not url or SIGNIN_URL_RE.search(url) or make_web_client_url(url) is None:
         return
-    if not MEETING_URL or (len(url) > len(MEETING_URL) and ("tk=" in url or "pwd=" in url)):
+    curr_q = len(urllib.parse.urlparse(MEETING_URL).query) if MEETING_URL else -1
+    new_q = len(urllib.parse.urlparse(url).query)
+    # Always keep the fullest link with tokens (tk=, pwd=, etc.) so no signin/register is needed
+    if not MEETING_URL or new_q > curr_q or ("tk=" in url and "tk=" not in MEETING_URL):
         MEETING_URL = url
-        log(f"Remembered meeting link: {mask_url(url)}")
+        log(f"Remembered full meeting link ({new_q} query chars): {mask_url(url)}")
 
 
 # --------------------------------------------------------------------------
@@ -1034,8 +1041,17 @@ LAST_ZOOM_URL = ""  # the exact link the portal opened (used only to reload afte
 
 async def click_join(context, page, btn, wait_sec: int = 25):
     known_pages = set(context.pages)
-    try:  # the portal button's own link is the best source of the meeting id/password
-        remember_meeting_url(await btn.get_attribute("href") or "")
+    try:  # the portal button's own link is the best source of the meeting id/password/token
+        href = await btn.get_attribute("href") or ""
+        if href:
+            remember_meeting_url(href)
+    except Exception:
+        pass
+    try:
+        onclick = await btn.get_attribute("onclick") or ""
+        m = re.search(r"https?://[^\s'\"]+zoom[^\s'\"]+", onclick)
+        if m:
+            remember_meeting_url(m.group(0))
     except Exception:
         pass
     try:
@@ -1311,8 +1327,28 @@ async def to_web_client(context, zp):
                 continue
             return zp  # nothing left to try: wait_in_meeting reports it
 
-        # Open the direct web-client link(s) first (a new one every 15 s if nothing loads)
-        if di < len(direct) and time.monotonic() - last_click > (0 if di == 0 else 15):
+        # 1. Try Zoom's in-page 'Join from browser' link/button first (uses Zoom's exact session token)
+        if clicks < 2 and time.monotonic() - last_click > (0 if clicks == 0 else 12):
+            href = await browser_join_href(zp)
+            if href:
+                log(f"Following in-page 'Join from browser' link: {mask_url(href)}")
+                try:
+                    await zp.goto(href, wait_until="commit", timeout=15000)
+                    clicks += 1
+                    last_click = time.monotonic()
+                    await asyncio.sleep(3)
+                    continue
+                except Exception as e:
+                    log(f"In-page link goto hiccup ({type(e).__name__})")
+            if await click_browser_join(zp):
+                clicks += 1
+                last_click = time.monotonic()
+                log(f"Clicked 'Join from browser' (attempt {clicks})")
+                await asyncio.sleep(3)
+                continue
+
+        # 2. Direct web-client fallback (exact same host + full query parameters, no signin/register)
+        if di < len(direct) and time.monotonic() - last_click > 12:
             target = direct[di]
             di += 1
             log(f"Opening direct web client URL #{di}: {mask_url(target)}")
@@ -1325,8 +1361,8 @@ async def to_web_client(context, zp):
             log(f"After direct goto #{di} the tab is at: {mask_url(zp.url)} | hops: {' > '.join(NAV_LOG[-4:])}")
             continue
 
-        # One clean attempt in a brand-new tab (the launch page's own scripts can interfere)
-        if di >= len(direct) and not tried_newtab and direct:
+        # 3. Clean fresh tab fallback if the launch page is stalled
+        if di >= len(direct) and not tried_newtab and direct and time.monotonic() - last_click > 12:
             tried_newtab = True
             log("Trying the direct web client link in a fresh tab")
             try:
@@ -1339,8 +1375,8 @@ async def to_web_client(context, zp):
             last_click = time.monotonic()
             continue
 
-        # Last resort: click 'Join from browser' (bounded so it can never stall the run)
-        if di >= len(direct) and time.monotonic() - last_click > 15:
+        # 4. Periodic retry of in-page click if still on launch screen
+        if time.monotonic() - last_click > 15:
             try:
                 if await asyncio.wait_for(click_browser_join(zp), 20):
                     clicks += 1
