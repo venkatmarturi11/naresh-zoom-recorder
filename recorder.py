@@ -1288,10 +1288,15 @@ async def click_join(context, page, btn, wait_sec: int = 25):
         pass
     try:
         async with context.expect_page(timeout=6000) as new_page_info:
-            await btn.click()
+            try:
+                await btn.click(force=True, timeout=4000)
+            except Exception:
+                await btn.evaluate("b => b.click()")
         await new_page_info.value
     except PWTimeout:
         pass  # same-tab redirect; handled by the URL scan below
+    except Exception:
+        pass
 
     end = time.monotonic() + wait_sec
     while time.monotonic() < end:
@@ -1324,7 +1329,7 @@ async def click_browser_join(zp) -> bool:
             try:
                 loc = frame.get_by_role(r, name=pat).first
                 if await asyncio.wait_for(loc.count(), 2) > 0 and await asyncio.wait_for(loc.is_visible(), 2):
-                    await loc.click(timeout=2500)
+                    await loc.click(force=True, timeout=2500)
                     return True
             except Exception:
                 pass
@@ -1332,11 +1337,17 @@ async def click_browser_join(zp) -> bool:
             loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
             if await asyncio.wait_for(loc.count(), 3) > 0:
                 try:
-                    await loc.click(timeout=2500)  # click() scrolls into view itself
+                    await loc.click(force=True, timeout=2500)  # click() scrolls into view itself
                 except Exception:
-                    await asyncio.wait_for(loc.evaluate(
-                        "b => { b.click(); const a = b.closest('a'); "
-                        "if (a && a.href && !a.href.startsWith('javascript:')) window.location.href = a.href; }"), 3)
+                    await asyncio.wait_for(loc.evaluate("""b => {
+                        b.scrollIntoView();
+                        b.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                        b.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                        b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                        b.click();
+                        const a = b.closest('a');
+                        if (a && a.href && !a.href.startsWith('javascript:')) window.location.href = a.href;
+                    }"""), 3)
                 return True
         except Exception:
             continue
