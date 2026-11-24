@@ -266,14 +266,27 @@ def class_start_dt() -> datetime:
 
 
 def keyword_pattern(kw: str) -> re.Pattern:
-    """Supports single keywords or pipe-separated variants like 'React JS|React'."""
+    """Supports single keywords, pipe-separated variants, and common course aliases
+    like 'Advanced Java' -> 'ADV JAVA' / 'ADV. JAVA' / 'Advance Java'."""
     parts = [p.strip() for p in kw.split("|") if p.strip()]
-    if len(parts) > 1:
-        pat = "|".join(re.escape(p) for p in parts)
-    elif parts:
-        pat = re.escape(parts[0])
-    else:
-        pat = ".*"
+    if not parts:
+        return re.compile(r".*", re.I)
+    expanded = []
+    for p in parts:
+        words = p.split()
+        word_patterns = []
+        for w in words:
+            wl = w.lower().strip(".")
+            if wl in ("adv", "advance", "advanced"):
+                word_patterns.append(r"(?:adv(?:\.|ance(?:d)?)?)")
+            elif wl in ("react", "reactjs"):
+                word_patterns.append(r"(?:react(?:\s*js)?)")
+            elif wl in ("js", "javascript"):
+                word_patterns.append(r"(?:js|javascript)?")
+            else:
+                word_patterns.append(re.escape(w))
+        expanded.append(r"\s+".join(word_patterns))
+    pat = "|".join(expanded) if expanded else ".*"
     return re.compile(pat, re.I)
 
 
