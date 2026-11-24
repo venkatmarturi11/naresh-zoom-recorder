@@ -1282,27 +1282,17 @@ async def zoom_signin(zp) -> bool:
 
 async def to_web_client(context, zp):
     """Zoom launch page -> click 'Join from your browser' -> pre-join screen.
-    Guarantees entering the Web Client:
-    1. Clicks 'Join from your browser'
-    2. If page stays on launch screen, opens direct /wc/{meeting_id}/join URL."""
-    step.record("Zoom Client", "💻", "Zoom launch page reached; opening the browser web client directly")
+    Zero URL rewriting: preserves the portal's exact webinar attendee token (tk)
+    and #success fragment. Lets Zoom's launch page authenticate the registered user."""
+    step.record("Zoom Client", "💻", "Zoom launch page reached; opening web client via in-page Join link")
     deadline = time.monotonic() + 180
     last_click = 0.0
     clicks = 0
-    last_good, reloads, generic_retries = LAST_ZOOM_URL, 0, 0
-    signin_recoveries = 0
-
-    # The launch page can stop responding once it tries to open the desktop app, so
-    # do what the real "Join from browser" button does: open the web-client URL
-    # (same tk / pwd) ourselves, without clicking anything first.
+    reloads = 0
     dismiss_browser_prompt()
-    candidates = [u for u in (MEETING_URL, LAST_ZOOM_URL, zp.url)
-                  if u and not SIGNIN_URL_RE.search(u) and make_web_client_urls(u)]
-    source = max(candidates, key=lambda u: len(urllib.parse.urlparse(u).query), default="")
-    direct = make_web_client_urls(source)
-    log(f"Direct web client candidates: {len(direct)} (link has token: {'tk=' in source})")
-    di = 0
-    tried_newtab = False
+
+    orig_url = LAST_ZOOM_URL or zp.url
+    log(f"Preserving exact portal Zoom link (zero URL rewriting): {mask_url(orig_url)}")
 
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
@@ -1314,64 +1304,48 @@ async def to_web_client(context, zp):
             except Exception:
                 pass
             if is_generic_join_page(zp):
-                if generic_retries < 1 and last_good:
-                    generic_retries += 1
-                    log("Zoom showed its generic 'Join Meeting' page; reopening the portal's Zoom page once")
-                    try:
-                        await zp.goto(last_good, wait_until="domcontentloaded")
-                    except Exception:
-                        pass
-                    clicks, last_click = 0, 0.0
-                    continue
-                await notify_photo(zp, "⚠️ Zoom dropped to the generic Join Meeting page")
-                raise RuntimeError("Zoom did not accept the meeting link (generic Join Meeting page)")
+                log("Zoom showed generic 'Join Meeting' page; reopening exact portal link")
+                try:
+                    await zp.goto(orig_url, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                clicks, last_click = 0, 0.0
+                await asyncio.sleep(3)
+                continue
             log(f"Web client active: {mask_url(zp.url)}")
             dismiss_browser_prompt()  # page is fully loaded now, so Escape is safe
             return zp
+
         if zp.is_closed():
             alive = [p for p in context.pages if _is_zoom_host(p.url)]
             if not alive:
                 raise RuntimeError("Zoom tab closed before the web client loaded")
             zp = alive[-1]
-        if zp.url.startswith("chrome-error://") and last_good and reloads < 2:
+
+        if zp.url.startswith("chrome-error://") and reloads < 3:
             reloads += 1
-            log(f"Zoom tab hit a browser error page; reloading the Zoom page ({reloads}/2)")
+            log(f"Zoom tab hit a browser error page; reloading original portal link ({reloads}/3)")
             try:
-                await zp.goto(last_good, wait_until="domcontentloaded")
+                await zp.goto(orig_url, wait_until="domcontentloaded")
             except Exception:
                 pass
             clicks, last_click = 0, 0.0
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             continue
-        if _is_zoom_host(zp.url):
-            last_good = zp.url
-        try:
-            _signin = await asyncio.wait_for(on_signin_page(zp), 10)
-        except Exception:
-            _signin = False
-        if _signin:
-            if signin_recoveries < 5 and await recover_from_signin(zp, signin_recoveries):
-                signin_recoveries += 1
-                clicks, last_click = 0, 0.0
-                continue
-            return zp  # nothing left to try: wait_in_meeting reports it
 
-        # 1. Direct web-client URL first (same host + tk/pwd). Gives each try 10s to redirect.
-        if di < len(direct) and (di == 0 or time.monotonic() - last_click > 10):
-            target = direct[di]
-            di += 1
-            log(f"Opening direct web client URL #{di}: {mask_url(target)}")
+        # Sign-in bounce guard: as a registered user, never stay on sign-in page
+        if re.search(r"sign-?in|sign-?up|register|login", zp.url, re.I):
+            log(f"🛡️ Zoom redirected to sign-in ({mask_url(zp.url)}); bouncing back to registered portal link")
             try:
-                await zp.goto(target, wait_until="commit", timeout=15000)
-            except Exception as e:
-                log(f"Direct web client goto hiccup ({type(e).__name__})")
-            last_click = time.monotonic()
-            await asyncio.sleep(4)
-            log(f"After direct goto #{di} the tab is at: {mask_url(zp.url)} | hops: {' > '.join(NAV_LOG[-4:])}")
+                await zp.goto(orig_url, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            clicks, last_click = 0, 0.0
+            await asyncio.sleep(3)
             continue
 
-        # 2. In-page 'Join from browser' button/link (max 3 bounded tries)
-        if clicks < 3 and time.monotonic() - last_click > 8:
+        # Try Zoom's in-page 'Join from browser' button/link
+        if clicks < 4 and time.monotonic() - last_click > (0 if clicks == 0 else 8):
             href = await browser_join_href(zp)
             if href:
                 log(f"Following in-page 'Join from browser' link: {mask_url(href)}")
@@ -1379,7 +1353,10 @@ async def to_web_client(context, zp):
                     await zp.goto(href, wait_until="commit", timeout=10000)
                     clicks += 1
                     last_click = time.monotonic()
-                    await asyncio.sleep(2)
+                    for _ in range(6):
+                        await asyncio.sleep(1)
+                        if await _has_webclient(context, zp):
+                            break
                     continue
                 except Exception as e:
                     log(f"In-page link goto hiccup ({type(e).__name__})")
@@ -1387,32 +1364,23 @@ async def to_web_client(context, zp):
                 clicks += 1
                 last_click = time.monotonic()
                 log(f"Clicked 'Join from browser' (attempt {clicks})")
-                await asyncio.sleep(2)
+                for _ in range(6):
+                    await asyncio.sleep(1)
+                    if await _has_webclient(context, zp):
+                        break
                 continue
 
-        # 3. Clean fresh tab fallback if the launch page is stalled
-        if di >= len(direct) and not tried_newtab and direct and time.monotonic() - last_click > 12:
-            tried_newtab = True
-            log("Trying the direct web client link in a fresh tab")
+        # If still on launch page after multiple clicks, safely reload the exact portal URL to refresh the launch state
+        if clicks >= 3 and time.monotonic() - last_click > 15:
+            log("Reloading original registered portal Zoom link...")
             try:
-                np_ = await context.new_page()
-                await np_.goto(direct[0], wait_until="commit", timeout=15000)
-                await asyncio.sleep(4)
-                log(f"Fresh tab is at: {mask_url(np_.url)}")
-            except Exception as e:
-                log(f"Fresh tab hiccup ({type(e).__name__})")
+                await zp.goto(orig_url, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            clicks = 0
             last_click = time.monotonic()
+            await asyncio.sleep(3)
             continue
-
-        # 4. Periodic retry of in-page click if still on launch screen
-        if time.monotonic() - last_click > 15:
-            try:
-                if await asyncio.wait_for(click_browser_join(zp), 12):
-                    clicks += 1
-                    log(f"Clicked 'Join from browser' (attempt {clicks})")
-            except Exception as e:
-                log(f"'Join from browser' click hiccup ({type(e).__name__})")
-            last_click = time.monotonic()
 
         await asyncio.sleep(1)
     try:
@@ -1515,17 +1483,17 @@ async def zoom_prejoin(zp) -> None:
                 ).first
                 if await name_in.count() and await name_in.is_visible():
                     val = await name_in.input_value()
-                    if not val.strip():
+                    if not val.strip() or val.strip().lower() in ("guest", "zoom", "user"):
                         await name_in.fill(PARTICIPANT_NAME)
                         step.record("Participant Name", "👤", f"Filled student display name: {PARTICIPANT_NAME}")
-                        await name_in.press("Enter")
+                        await asyncio.sleep(0.5)
             except Exception:
                 continue
 
         if await click_prejoin_join(zp):
             clicked_join = True
             step.record("Zoom Pre-Join", "🚀", "Clicked Zoom pre-join 'Join' button")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             if await in_meeting(zp):
                 break
             text = await page_text(zp)
@@ -1616,24 +1584,22 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if is_generic_join_page(zp):
             await notify_photo(zp, "⚠️ Zoom dropped to the generic Join Meeting page")
             raise RuntimeError("Zoom did not accept the meeting link (generic Join Meeting page)")
-        if await on_signin_page(zp):
+        if await on_signin_page(zp) or re.search(r"sign-?in|sign-?up|register|login", zp.url, re.I):
             stable = 0
-            await notify_photo(zp, "🔐 Zoom is asking for sign-in\nRedirect chain (values hidden):\n" + "\n".join(NAV_LOG[-8:]))
-            if signin_tries < 2 and await zoom_signin(zp):
+            orig = LAST_ZOOM_URL or MEETING_URL
+            if signin_tries < 5 and orig:
                 signin_tries += 1
-                target = make_web_client_url(MEETING_URL or LAST_ZOOM_URL)
-                if target:  # after login Zoom lands on the profile page; go back to the meeting
-                    try:
-                        await zp.goto(target, wait_until="domcontentloaded")
-                    except Exception:
-                        pass
+                log(f"🛡️ Zoom redirected to sign-in ({mask_url(zp.url)}); bouncing back to registered portal link ({signin_tries}/5)")
+                try:
+                    await zp.goto(orig, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
                 continue
-            log(f"Sign-in wall at {mask_url(zp.url)} (meeting link captured: {bool(MEETING_URL)})")
-            raise SigninRequired(
-                "Zoom asked for sign-in and the meeting could not be joined as a guest "
-                "(the host may have enabled 'Only authenticated users can join'). "
-                "Set ZOOM_EMAIL / ZOOM_PASS (a Zoom account) to join automatically."
-            )
+            if await zoom_signin(zp):
+                continue
+            await asyncio.sleep(2)
+            continue
         await dismiss_popups(zp)
         if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
             stable += 1
@@ -1908,7 +1874,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-24a (direct-first web client + hard-bounded page calls)")
+        log("Recorder build 2026-11-24b (zero URL rewriting + registered user bounce guard)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
