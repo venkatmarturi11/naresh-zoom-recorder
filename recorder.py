@@ -68,6 +68,8 @@ TG_BOT_TOKEN = _env("TG_BOT_TOKEN")
 TG_CHAT_ID = _env("TG_CHAT_ID")
 
 CLASS_KEYWORD = _env("CLASS_KEYWORD", "React JS")
+ACTIVE_CLASS_TITLE = CLASS_KEYWORD
+ACTIVE_CLASS_INFO = {}
 CLASS_START = _env("CLASS_START", "19:30")  # HH:MM, IST
 CLASS_END = _env("CLASS_END", "")  # HH:MM, IST (optional hard stop)
 CLASS_DURATION_MIN = _int_env("CLASS_DURATION_MIN", 90)
@@ -206,7 +208,7 @@ class StepTracker:
         time_disp = (CLASS_START or 'Immediate') + " IST"
         header = (
             f"## 🎥 Zoom Class Recording Summary\n\n"
-            f"- **Class Keyword:** `{CLASS_KEYWORD}`\n"
+            f"- **Class Name:** `{ACTIVE_CLASS_TITLE}`\n"
             f"- **Class Time:** `{time_disp}`" + (f" - `{CLASS_END} IST`" if CLASS_END else "") + "\n"
             f"- **Date:** `{datetime.now(IST).strftime('%Y-%m-%d')}`\n\n"
             f"| Step | Status | Time (IST) | Details |\n"
@@ -806,53 +808,269 @@ async def join_ready(btn) -> bool:
         return False
 
 
-async def find_active_join(page):
-    """Find the join button for CLASS_KEYWORD. Searches candidate cards and
-    prefers the one whose Join button is ready/active. Returns (card, button)."""
-    join_any = page.locator("a, button, [role='button']").filter(
-        has_text=re.compile(r"\bjoin\b", re.I)
-    )
-    kw_re = keyword_pattern(CLASS_KEYWORD)
-    cards = (
-        page.locator("div, li, tr, article, section")
-        .filter(has_text=kw_re)
-        .filter(has=join_any)
-    )
+DURATION_RE = re.compile(r"(\d{1,2})[:.](\d{2})\s*(?:Hr\'?s?|hrs?|hours?)", re.I)
+TIME_RE = re.compile(
+    r"\b(\d{1,2})[:.](\d{2})\s*([AP]M)?|\b(\d{1,2})(\d{2})\s*([AP]M)|\b(\d{1,2})\s*([AP]M)\b",
+    re.I,
+)
+
+
+def _dt(h, m, ap, base):
+    """Build a datetime from hour, minute, optional AM/PM and a reference date."""
+    h, m = int(h), int(m)
+    if ap:
+        h = h % 12 + (12 if ap.upper() == "PM" else 0)
+    return base.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def card_window(text: str, now: datetime):
+    """Parse start and end times from card text.
+    Supports:
+      - NareshIT portal: "ADV JAVA 6 PM ... 06:00 PM • 01:30 Hr's" -> 18:00 to 19:30
+      - NareshIT portal: "React JS 730 PM ... 07:30 PM • 01:30 Hr's" -> 19:30 to 21:00
+      - Standard range:  "10:00 AM - 11:00 AM", "15:00 to 16:00"
+      - Shared period:   "10:00 - 11:00 AM"
+      - Single time:     "6:00 PM" / "6pm" -> duration or +60 min
+    """
+    if not text:
+        return None
+    dur_match = DURATION_RE.search(text)
+    duration = None
+    if dur_match:
+        dh, dm = dur_match.groups()
+        duration = timedelta(hours=int(dh), minutes=int(dm))
+        text_no_dur = text[:dur_match.start()]
+    else:
+        text_no_dur = text
+
+    raw_times = []
+    for m in TIME_RE.finditer(text_no_dur):
+        g = m.groups()
+        h = g[0] or g[3] or g[6]
+        mi = g[1] or g[4] or "00"
+        ap = (g[2] or g[5] or g[7] or "").strip()
+        raw_times.append((h, mi, ap))
+
+    if not raw_times:
+        return None
+
+    if len(raw_times) > 1 and not raw_times[0][2] and raw_times[1][2]:
+        raw_times[0] = (raw_times[0][0], raw_times[0][1], raw_times[1][2])
+
+    dts = [_dt(*t, now) for t in raw_times]
+    if duration:
+        return dts[-1], dts[-1] + duration
+
+    distinct = []
+    for d in dts:
+        if not any(abs((d - x).total_seconds()) < 300 for x in distinct):
+            distinct.append(d)
+
+    start = distinct[0]
+    if len(distinct) > 1:
+        end = distinct[1]
+        if end < start:
+            start -= timedelta(hours=12)
+        if end < start:
+            end += timedelta(days=1)
+    else:
+        end = start + timedelta(hours=1)
+
+    return start, end
+
+
+async def auto_discover_cards(page):
+    """Auto-discover class card containers by locating Join buttons and
+    marking candidate cards."""
     try:
-        count = await cards.count()
-    except Exception:
-        return None, None
-    if count == 0:
+        await page.evaluate(
+            "() => document.querySelectorAll('[data-portal-card]').forEach(e => e.removeAttribute('data-portal-card'))"
+        )
+        cards_info = await page.evaluate("""() => {
+            const joinRe = /\\bjoin\\b/i;
+            const timeRe = /\\d{1,2}[:.:]\\d{2}\\s*[AP]M/i;
+            const buttons = [...document.querySelectorAll('button, a, [role="button"]')]
+                .filter(el => {
+                    const txt = (el.textContent || '').trim();
+                    return joinRe.test(txt) && txt.length < 30 && el.offsetParent !== null;
+                });
+            const results = [];
+            const seen = new Set();
+            for (const btn of buttons) {
+                let el = btn.parentElement;
+                let found = false;
+                for (let d = 0; d < 10 && el && el !== document.body; d++, el = el.parentElement) {
+                    const text = (el.innerText || '').trim();
+                    if (timeRe.test(text) && text.length < 1000 && !seen.has(text)) {
+                        seen.add(text);
+                        const marker = '__card_' + results.length;
+                        el.setAttribute('data-portal-card', marker);
+                        results.push(marker);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && btn.parentElement) {
+                    let p = btn.parentElement;
+                    for (let d = 0; d < 6 && p && p !== document.body; d++) {
+                        const cls = String(p.className || '').toLowerCase();
+                        const tag = p.tagName.toLowerCase();
+                        if (tag === 'tr' || tag === 'li' || tag === 'article' || cls.includes('card') || cls.includes('batch') || cls.includes('item')) {
+                            break;
+                        }
+                        if (p.parentElement === document.body) break;
+                        p = p.parentElement;
+                    }
+                    const text = ((p || btn.parentElement).innerText || '').trim();
+                    if (!seen.has(text)) {
+                        seen.add(text);
+                        const marker = '__card_' + results.length;
+                        (p || btn.parentElement).setAttribute('data-portal-card', marker);
+                        results.push(marker);
+                    }
+                }
+            }
+            return results;
+        }""")
+        if not cards_info:
+            return []
+        cards = []
+        for m in cards_info:
+            loc = page.locator(f"[data-portal-card='{m}']").first
+            if await loc.count() > 0:
+                cards.append(loc)
+        return cards
+    except Exception as exc:
+        log(f"Auto-discover cards error: {type(exc).__name__}")
+        return []
+
+
+async def find_active_join(page):
+    """Find the join button for the card matching current time (or CLASS_KEYWORD).
+    Discovers all cards, parses their times, checks button readiness, and selects
+    the card matching current time. Returns (card, button)."""
+    global ACTIVE_CLASS_TITLE, ACTIVE_CLASS_INFO
+    now = datetime.now(IST)
+    cards = await auto_discover_cards(page)
+
+    if not cards:
+        join_any = page.locator("a, button, [role='button']").filter(
+            has_text=re.compile(r"\bjoin\b", re.I)
+        )
+        try:
+            kw_re = keyword_pattern(CLASS_KEYWORD) if CLASS_KEYWORD and CLASS_KEYWORD.strip() else None
+            q = page.locator("div, li, tr, article, section").filter(has=join_any)
+            if kw_re:
+                q_kw = q.filter(has_text=kw_re)
+                if await q_kw.count() > 0:
+                    q = q_kw
+            cnt = await q.count()
+            for i in range(cnt):
+                c = q.nth(i)
+                if await c.locator(join_any).count() == 1:
+                    cards.append(c)
+        except Exception:
+            pass
+
+    if not cards:
         return None, None
 
-    fallback_card = None
-    fallback_btn = None
-    for i in reversed(range(count)):
-        c = cards.nth(i)
-        btn = c.locator("a, button, [role='button']").filter(
-            has_text=re.compile(r"\bjoin\b", re.I)
-        ).first
+    kw_re = keyword_pattern(CLASS_KEYWORD) if CLASS_KEYWORD and CLASS_KEYWORD.strip() else None
+    parsed_cards = []
+
+    for idx, card in enumerate(cards, 1):
         try:
-            if await btn.count() > 0:
-                if fallback_btn is None:
-                    fallback_card = c
-                    fallback_btn = btn
-                if await join_ready(btn):
-                    return c, btn
-        except Exception:
+            raw = (await card.inner_text(timeout=2000)).strip()
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            title = lines[0] if lines else f"Card #{idx}"
+            if len(lines) > 1 and ("hrs" in lines[0].lower() or "left" in lines[0].lower()):
+                title = lines[1]
+            title = re.sub(r"\b(join|live)\b", "", title, flags=re.I).strip(" -•|") or title[:40]
+
+            btn = card.locator("a, button, [role='button']").filter(
+                has_text=re.compile(r"\bjoin\b", re.I)
+            ).first
+            if await btn.count() == 0:
+                continue
+
+            is_ready = await join_ready(btn)
+            w = card_window(raw, now)
+            is_live_now = False
+            dist_to_now = 999999.0
+            start_str = ""
+            end_str = ""
+            status_str = "ℹ️ (No valid time detected)"
+
+            if w:
+                start, end = w
+                start_str = start.strftime("%I:%M %p")
+                end_str = end.strftime("%I:%M %p")
+                is_live_now = (start - timedelta(minutes=15)) <= now <= (end + timedelta(minutes=15))
+                dist_to_now = abs((now - start).total_seconds())
+                if is_live_now:
+                    status_str = f"🟢 LIVE NOW ({start_str} - {end_str})"
+                elif now < start:
+                    status_str = f"⏳ Scheduled for {start_str} - {end_str}"
+                else:
+                    status_str = f"⏹️ Finished at {end_str}"
+
+            matches_kw = bool(kw_re and kw_re.search(raw))
+
+            log(f"   [{idx}] {title[:35]:<35} -> {status_str} | Join ready: {is_ready}")
+
+            if is_live_now and is_ready and matches_kw:
+                score = (0, 0, dist_to_now)
+            elif is_live_now and is_ready:
+                score = (1, 0, dist_to_now)
+            elif is_ready:
+                score = (2, 0 if matches_kw else 1, dist_to_now)
+            elif is_live_now and matches_kw:
+                score = (3, 0, dist_to_now)
+            elif is_live_now:
+                score = (4, 0, dist_to_now)
+            elif matches_kw:
+                score = (5, 0, dist_to_now)
+            elif w and now < w[0]:
+                score = (6, 0, dist_to_now)
+            else:
+                score = (7, 0, dist_to_now)
+
+            parsed_cards.append({
+                "score": score,
+                "card": card,
+                "btn": btn,
+                "title": title,
+                "raw": raw,
+                "window": w,
+                "is_live_now": is_live_now,
+                "is_ready": is_ready,
+                "matches_kw": matches_kw,
+            })
+        except Exception as e:
+            log(f"   [{idx}] Error evaluating card #{idx}: {e}")
             continue
 
-    return fallback_card, fallback_btn
+    if not parsed_cards:
+        return None, None
+
+    parsed_cards.sort(key=lambda x: x["score"])
+    best = parsed_cards[0]
+    ACTIVE_CLASS_TITLE = best["title"]
+    ACTIVE_CLASS_INFO = best
+
+    log(f"🎯 Selected card: '{best['title']}' (Score: {best['score'][0]}, Live: {best['is_live_now']}, Ready: {best['is_ready']})")
+    return best["card"], best["btn"]
 
 
-# --------------------------------------------------------------------------
-# State 3: precision Join-button polling
-# --------------------------------------------------------------------------
 async def wait_and_join(context, page):
     now = datetime.now(IST)
     is_immediate = not CLASS_START or CLASS_START.lower() in ("now", "test", "immediate")
     start_dt = class_start_dt()
     diff_to_start = (start_dt - now).total_seconds()
+
+    # Pre-scan Today's Classes tab for active or live cards
+    card, btn = await find_active_join(page)
+    is_live_or_ready = bool(card and (ACTIVE_CLASS_INFO.get("is_live_now") or ACTIVE_CLASS_INFO.get("is_ready")))
 
     # ----------------------------------------------------------------------
     # Scenario A: Explicit immediate test requested (e.g. class_start="now")
@@ -861,59 +1079,56 @@ async def wait_and_join(context, page):
         step.record(
             "Immediate Run",
             "🚀",
-            f"Immediate run requested for '{CLASS_KEYWORD}'. Scanning for active Join button...",
+            f"Immediate run requested for '{ACTIVE_CLASS_TITLE}'. Scanning for active Join button...",
         )
         start_dt = now
         diff_to_start = 0
 
     # ----------------------------------------------------------------------
     # Scenario B: Class was scheduled for hours ago (already concluded)
+    # Only applies if no card is currently live or ready on the portal!
     # ----------------------------------------------------------------------
-    elif diff_to_start < -(CLASS_DURATION_MIN * 60 + 1800):
+    elif not is_live_or_ready and diff_to_start < -(CLASS_DURATION_MIN * 60 + 1800):
         hours_ago = abs(diff_to_start) / 3600
         step.record(
             "Class Status",
             "⏹️",
-            f"Class '{CLASS_KEYWORD}' was scheduled for {CLASS_START} IST ({hours_ago:.1f}h ago) and has already finished for today.",
+            f"Class '{ACTIVE_CLASS_TITLE}' was scheduled for {CLASS_START} IST ({hours_ago:.1f}h ago) and has already finished for today.",
         )
-        await notify(f"ℹ️ Class '{CLASS_KEYWORD}' scheduled for {CLASS_START} IST has already concluded for today.")
+        await notify(f"ℹ️ Class '{ACTIVE_CLASS_TITLE}' scheduled for {CLASS_START} IST has already concluded for today.")
         return None
 
     # ----------------------------------------------------------------------
     # Scenario C: Run triggered way too early (>45 minutes before class)
-    # E.g. user ran at 08:40 AM for a 19:30 class.
-    # We DO NOT wait 10 hours (runner would timeout at 4h).
-    # We DO NOT click Join 10 hours early (portal button is not live yet).
-    # Instead, we perform a clean pre-flight verification: verify login, verify card.
+    # Only applies if no card is currently live or ready on the portal!
     # ----------------------------------------------------------------------
-    elif diff_to_start > MAX_WAIT_MIN * 60:
+    elif not is_live_or_ready and diff_to_start > MAX_WAIT_MIN * 60:
         hours_away = diff_to_start / 3600
         mins_away = int(diff_to_start // 60)
         step.record(
             "Schedule Check",
             "ℹ️",
-            f"Class '{CLASS_KEYWORD}' starts at {CLASS_START} IST ({hours_away:.1f}h / {mins_away}m away).",
+            f"Class '{ACTIVE_CLASS_TITLE}' starts at {CLASS_START} IST ({hours_away:.1f}h / {mins_away}m away).",
         )
-        card, btn = await find_active_join(page)
         if card is not None:
             step.record(
                 "Portal Verification",
                 "✅",
-                f"Verified: Found '{CLASS_KEYWORD}' card on portal. Portal login & card search 100% operational.",
+                f"Verified: Found '{ACTIVE_CLASS_TITLE}' card on portal. Portal login & card search 100% operational.",
             )
         else:
             step.record(
                 "Portal Verification",
                 "ℹ️",
-                f"Portal login successful. Card for '{CLASS_KEYWORD}' is not yet posted by host for today.",
+                f"Portal login successful. Card for '{ACTIVE_CLASS_TITLE}' is not yet posted by host for today.",
             )
         step.record(
             "Scheduler Standby",
             "⏰",
-            f"Standing by. Cloudflare Scheduler (https://class-scheduler.class-scheduler.workers.dev) triggers automatically 13 mins before {CLASS_START} IST.",
+            f"Standing by. Cloudflare Scheduler triggers automatically 13 mins before {CLASS_START} IST.",
         )
         await notify(
-            f"✅ Pre-flight check successful: portal login & navigation verified for '{CLASS_KEYWORD}'. "
+            f"✅ Pre-flight check successful: portal login & navigation verified for '{ACTIVE_CLASS_TITLE}'. "
             f"Class starts at {CLASS_START} IST ({hours_away:.1f}h away). Scheduler will trigger at class time."
         )
         return None
@@ -925,27 +1140,30 @@ async def wait_and_join(context, page):
     last_wait_log = 0.0
     last_reload = time.monotonic()
 
-    # --- Phase 1: Wait calmly until class start time (start_dt - 15s) ---
-    while datetime.now(IST) < start_dt - timedelta(seconds=15):
-        now = datetime.now(IST)
-        rem_sec = int((start_dt - now).total_seconds())
-        if rem_sec <= 15:
-            break
+    # --- Phase 1: Wait calmly until class start time (only if NOT already live/ready) ---
+    if not is_live_or_ready and not is_immediate and diff_to_start > 0:
+        while datetime.now(IST) < start_dt - timedelta(seconds=15):
+            now = datetime.now(IST)
+            card, btn = await find_active_join(page)
+            if card and (ACTIVE_CLASS_INFO.get("is_live_now") or ACTIVE_CLASS_INFO.get("is_ready")):
+                break
+            rem_sec = int((start_dt - now).total_seconds())
+            if rem_sec <= 15:
+                break
 
-        if time.monotonic() - last_wait_log >= 120 or last_wait_log == 0.0:
-            last_wait_log = time.monotonic()
-            mins, secs = divmod(rem_sec, 60)
-            step.record(
-                "Waiting for Class Time",
-                "⏳",
-                f"Class '{CLASS_KEYWORD}' starts at {CLASS_START} IST ({mins}m {secs:02d}s remaining). Waiting quietly...",
-            )
+            if time.monotonic() - last_wait_log >= 120 or last_wait_log == 0.0:
+                last_wait_log = time.monotonic()
+                mins, secs = divmod(rem_sec, 60)
+                step.record(
+                    "Waiting for Class Time",
+                    "⏳",
+                    f"Class '{ACTIVE_CLASS_TITLE}' starts at {CLASS_START} IST ({mins}m {secs:02d}s remaining). Waiting quietly...",
+                )
 
-        sleep_time = min(5.0, max(1.0, float(rem_sec - 15)))
-        await asyncio.sleep(sleep_time)
+            sleep_time = min(5.0, max(1.0, float(rem_sec - 15)))
+            await asyncio.sleep(sleep_time)
 
-    # --- Phase 2: Start time reached! One clean refresh to fetch active DOM ---
-    if not is_immediate and diff_to_start > 0:
+        # --- Phase 2: Start time reached! One clean refresh to fetch active DOM ---
         step.record(
             "Class Time Reached",
             "🔄",
@@ -967,13 +1185,14 @@ async def wait_and_join(context, page):
 
         if found:
             is_active = await join_ready(btn)
-            too_early = (start_dt - now).total_seconds() > 30
+            is_live_card = ACTIVE_CLASS_INFO.get("is_live_now", False)
+            too_early = not is_live_card and not is_active and (start_dt - now).total_seconds() > 30
 
             if is_active and not too_early:
                 step.record(
                     "Join Button",
                     "🎯",
-                    f"Join button is active and clickable! Clicking Join for '{CLASS_KEYWORD}'...",
+                    f"Join button is active and clickable! Clicking Join for '{ACTIVE_CLASS_TITLE}'...",
                 )
                 prev_url = page.url
                 zp = await click_join(context, page, btn, wait_sec=25)
@@ -1004,13 +1223,13 @@ async def wait_and_join(context, page):
                         step.record(
                             "Waiting for Class Time",
                             "⏳",
-                            f"Found '{CLASS_KEYWORD}' card. Waiting for class start time ({mins}m {secs:02d}s remaining)...",
+                            f"Found '{ACTIVE_CLASS_TITLE}' card. Waiting for class start time ({mins}m {secs:02d}s remaining)...",
                         )
                     else:
                         step.record(
                             "Waiting for Host",
                             "⏳",
-                            f"Found '{CLASS_KEYWORD}' card. Waiting for host/teacher to activate Join button...",
+                            f"Found '{ACTIVE_CLASS_TITLE}' card. Waiting for host/teacher to activate Join button...",
                         )
                 since_reload = time.monotonic() - last_reload
                 if since_reload >= 60:
@@ -1029,7 +1248,7 @@ async def wait_and_join(context, page):
                 step.record(
                     "Searching Card",
                     "🔍",
-                    f"Searching for '{CLASS_KEYWORD}' card in Today's Classes tab...",
+                    f"Scanning Today's Classes tab for live class at current time ({now:%I:%M %p} IST)...",
                 )
 
             since_reload = time.monotonic() - last_reload
@@ -1043,9 +1262,9 @@ async def wait_and_join(context, page):
 
         await asyncio.sleep(2)
 
-    step.record("Waiting for Join", "❌", f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} mins")
+    step.record("Waiting for Join", "❌", f"Join button for '{ACTIVE_CLASS_TITLE}' did not become active within {MAX_WAIT_MIN} mins")
     raise TimeoutError(
-        f"Join button for '{CLASS_KEYWORD}' did not become active within {MAX_WAIT_MIN} minutes"
+        f"Join button for '{ACTIVE_CLASS_TITLE}' did not become active within {MAX_WAIT_MIN} minutes"
     )
 
 
@@ -1804,7 +2023,7 @@ async def upload_to_telegram(path: str) -> None:
     size = os.path.getsize(path)
     parts = [path] if size <= TG_SIZE_LIMIT else await asyncio.to_thread(split_file, path)
     total = len(parts)
-    base_caption = f"🎥 {CLASS_KEYWORD} | {datetime.now(IST).strftime('%Y-%m-%d')}"
+    base_caption = f"🎥 {ACTIVE_CLASS_TITLE} | {datetime.now(IST).strftime('%Y-%m-%d')}"
     step.record("Telegram Upload", "📤", f"Uploading {total} part(s) ({size / 1024**3:.2f} GB total) to @Meeting_recorder_bot")
 
     async with Client(
@@ -1860,7 +2079,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-24c (no login/sign-in: network abort + zero URL rewriting + prejoin auto-detect)")
+        log("Recorder build 2026-11-24d (current-time live card auto-discovery)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -1980,7 +2199,7 @@ async def main() -> int:
 
                 recorder.start()
                 started = time.monotonic()
-                step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{CLASS_KEYWORD}'")
+                step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{ACTIVE_CLASS_TITLE}'")
                 await notify("✅ Joined class & started 1080p recording")
 
                 await go_fullscreen(zoom_page)
