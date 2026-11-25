@@ -2,5 +2,9 @@
   "ExternalProtocolDialogShowAlwaysOpenCheckbox": false,
   "DefaultNotificationsSetting": 2,
   "PasswordManagerEnabled": false,
-  "TranslateEnabled": false
+  "TranslateEnabled": false,
+  "DefaultMediaStreamSetting": 1,
+  "AudioCaptureAllowed": true,
+  "VideoCaptureAllowed": true,
+  "AudioCaptureAllowedUrls": ["https://*.zoom.us"]
 }

@@ -183,6 +183,8 @@ CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
+    "--use-fake-ui-for-media-stream",
+    "--use-fake-device-for-media-stream",
     "--window-size=1920,1080",
     "--window-position=0,0",
     "--kiosk",
@@ -1827,8 +1829,9 @@ POPUP_PATTERNS = [
     r"^not now$",
     r"^maybe later$",
     r"^no,? thanks$",
-    r"^continue without (audio|microphone)$",
+    r"^continue without (audio|microphone|camera|audio and video)$",
     r"^continue$",
+    r"^allow access\b",
 ]
 
 
@@ -2183,7 +2186,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-25b (direct-fallback web client + single pre-join click)")
+        log("Recorder build 2026-11-25c (auto-granted mic/cam permissions + stealth)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -2202,7 +2205,7 @@ async def main() -> int:
                 locale="en-IN",
                 args=CHROMIUM_ARGS,
                 ignore_default_args=["--enable-automation"],
-                permissions=[],
+                permissions=["microphone", "camera"],
                 accept_downloads=False,
                 no_viewport=True,
             )
@@ -2221,6 +2224,10 @@ async def main() -> int:
             await context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
                 "window.chrome = window.chrome || { runtime: {} };"
+                "Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });"
+                "Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });"
+                "try { const oq = navigator.permissions.query; navigator.permissions.query = (p) => "
+                "(p.name === 'microphone' || p.name === 'camera' ? Promise.resolve({ state: 'granted' }) : oq(p)); } catch(e){};"
                 "const _open=window.open;window.open=(u,...a)=>"
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
             )
