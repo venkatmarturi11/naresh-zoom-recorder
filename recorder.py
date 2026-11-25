@@ -1328,20 +1328,44 @@ async def click_join(context, page, btn, wait_sec: int = 25):
 # State 4: Zoom web client, strictly no mic / no video
 # --------------------------------------------------------------------------
 async def click_browser_join(zp) -> bool:
-    """Click 'Join from browser'. If clicking doesn't trigger navigation,
-    extract the href from the <a> tag and navigate explicitly.
-    Every Playwright call is bounded so a frozen launch page can never eat
-    the whole to_web_client deadline."""
+    """Click 'Join from browser' on Zoom's Vue.js launch page.
+    Playwright's synthesized click often does NOT fire Vue's event handler,
+    so we use a full PointerEvent + MouseEvent dispatch sequence, then fall
+    back to extracting the webClientUrl from the page and navigating."""
     pat = re.compile(r"join from (your )?browser", re.I)
     url_before = zp.url
 
-    # Strategy 1: find and click the visible button/link
+    # Strategy 1: JavaScript-level full event dispatch (fires Vue handlers)
+    try:
+        navigated = await zp.evaluate("""() => {
+            const pat = /join from.*browser/i;
+            const els = [...document.querySelectorAll('button, a, [role="button"]')]
+                .filter(e => pat.test(e.textContent || '') && e.offsetParent !== null);
+            if (!els.length) return false;
+            const b = els[0];
+            b.scrollIntoView();
+            for (const E of [PointerEvent, MouseEvent]) {
+                for (const t of ['pointerdown','pointerup','mousedown','mouseup','click']) {
+                    try { b.dispatchEvent(new E(t, {bubbles:true, cancelable:true, view:window})); } catch(e) {}
+                }
+            }
+            b.click();
+            return true;
+        }""")
+        if navigated:
+            log("Dispatched full pointer+click events on 'Join from browser' button")
+            await asyncio.sleep(2.5)
+            if zp.url != url_before or "/wc/" in zp.url:
+                return True
+    except Exception:
+        pass
+
+    # Strategy 2: Playwright role-based click (link first, then button)
     for frame in zp.frames:
         for r in ("link", "button"):
             try:
                 loc = frame.get_by_role(r, name=pat).first
                 if await asyncio.wait_for(loc.count(), 2) > 0 and await asyncio.wait_for(loc.is_visible(), 2):
-                    # If it's an <a>, grab href first so we can follow it if click fails
                     href = None
                     try:
                         tag = await loc.evaluate("el => el.tagName.toLowerCase()")
@@ -1351,69 +1375,43 @@ async def click_browser_join(zp) -> bool:
                                 href = urllib.parse.urljoin(zp.url, href)
                     except Exception:
                         pass
-
                     await loc.click(force=True, timeout=2500)
                     await asyncio.sleep(1.5)
-
-                    # Check if the click actually navigated
-                    if zp.url != url_before:
+                    if zp.url != url_before or "/wc/" in zp.url:
                         return True
-
-                    # If click didn't navigate but we have the href, go there explicitly
                     if href and href.startswith("http") and _is_zoom_host(href):
-                        log(f"Click didn't navigate; following href directly: {mask_url(href)}")
+                        log(f"Click didn't navigate; following href: {mask_url(href)}")
                         try:
                             await zp.goto(href, wait_until="commit", timeout=15000)
+                            if zp.url != url_before or "/wc/" in zp.url:
+                                return True
                         except Exception:
                             pass
-                    return True
             except Exception:
                 pass
 
-    # Strategy 2: broader locator search
-    for frame in zp.frames:
-        try:
-            loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
-            if await asyncio.wait_for(loc.count(), 3) > 0:
-                # Try to get the href before clicking
-                href = None
-                try:
-                    href = await loc.evaluate("""el => {
-                        const a = el.closest('a') || (el.tagName === 'A' ? el : null);
-                        return a ? a.href : null;
-                    }""")
-                except Exception:
-                    pass
-
-                try:
-                    await loc.click(force=True, timeout=2500)
-                    await asyncio.sleep(1.5)
-                except Exception:
-                    # DOM dispatch fallback
-                    try:
-                        await asyncio.wait_for(loc.evaluate("""b => {
-                            b.scrollIntoView();
-                            b.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
-                            b.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
-                            b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                            b.click();
-                            const a = b.closest('a');
-                            if (a && a.href && !a.href.startsWith('javascript:')) window.location.href = a.href;
-                        }"""), 3)
-                        await asyncio.sleep(1.5)
-                    except Exception:
-                        pass
-
-                # If click didn't navigate but we have the href, go there
-                if zp.url == url_before and href and href.startswith("http") and _is_zoom_host(href):
-                    log(f"Click didn't navigate; following href directly: {mask_url(href)}")
-                    try:
-                        await zp.goto(href, wait_until="commit", timeout=15000)
-                    except Exception:
-                        pass
+    # Strategy 3: Extract webClientUrl from the page's JS/protobuf data
+    try:
+        wc_url = await zp.evaluate("""() => {
+            for (const s of document.querySelectorAll('script')) {
+                const t = s.textContent || '';
+                const m = t.match(/webClientUrl['":\\s]*['"]?(https?:\\/\\/[^'"\\s,}]+)/);
+                if (m) return m[1];
+            }
+            const u = new URL(location.href);
+            const m2 = u.pathname.match(/\\/(?:w|j|s)\\/(\\d{9,})/);
+            if (m2) return u.origin + '/wc/' + m2[1] + '/join' + u.search;
+            return null;
+        }""")
+        if wc_url and _is_zoom_host(wc_url):
+            log(f"Extracted web client URL from page: {mask_url(wc_url)}")
+            await zp.goto(wc_url, wait_until="commit", timeout=15000)
+            await asyncio.sleep(2)
+            if zp.url != url_before or "/wc/" in zp.url:
                 return True
-        except Exception:
-            continue
+    except Exception:
+        pass
+
     return False
 
 
@@ -1639,8 +1637,8 @@ async def to_web_client(context, zp):
                 clicks += 1
                 last_click = time.monotonic()
                 log(f"Clicked 'Join from browser' (attempt {clicks})")
-                # Wait up to 15 seconds for the web client to appear
-                for _ in range(15):
+                # Wait up to 12 seconds for the web client to appear
+                for _ in range(12):
                     await asyncio.sleep(1)
                     found = await _has_webclient(context, zp)
                     if found:
@@ -1665,8 +1663,25 @@ async def to_web_client(context, zp):
                 except Exception as e:
                     log(f"In-page link goto hiccup ({type(e).__name__})")
 
-        # If 25s elapsed without transition, reload the exact registered portal link
-        if clicks >= 2 and time.monotonic() - last_click > 20:
+        # Direct web client URL fallback: preserves attendee tk and pwd parameters
+        if clicks >= 1 and time.monotonic() - last_click > 10:
+            direct_urls = make_web_client_urls(orig_url or zp.url)
+            if direct_urls:
+                target = direct_urls[0]
+                log(f"Opening direct web client URL (preserved tokens): {mask_url(target)}")
+                try:
+                    await zp.goto(target, wait_until="commit", timeout=15000)
+                    last_click = time.monotonic()
+                    for _ in range(10):
+                        await asyncio.sleep(1)
+                        if await _has_webclient(context, zp):
+                            break
+                    continue
+                except Exception as e:
+                    log(f"Direct WC goto hiccup ({type(e).__name__})")
+
+        # If 30s elapsed without transition, reload the exact registered portal link
+        if clicks >= 2 and time.monotonic() - last_click > 30:
             log("Reloading original registered portal Zoom link...")
             try:
                 await zp.goto(orig_url, wait_until="domcontentloaded")
@@ -1789,13 +1804,11 @@ async def zoom_prejoin(zp) -> None:
         if await click_prejoin_join(zp):
             clicked_join = True
             step.record("Zoom Pre-Join", "🚀", "Clicked Zoom pre-join 'Join' button")
-            for _ in range(8):
+            for _ in range(12):
                 await asyncio.sleep(1)
-                if await in_meeting(zp):
+                if await in_meeting(zp) or await on_signin_page(zp):
                     return
-            text = await page_text(zp)
-            if not re.search(r"cannot detect your camera|terms of service", text, re.I):
-                break
+            break  # Crucial: NEVER click Join a second time (re-clicking invalidates attendee token)
         await asyncio.sleep(1)
 
     if not clicked_join:
@@ -1915,10 +1928,7 @@ async def wait_in_meeting(zp, max_wait: int = 300) -> None:
         if not sent_debug and elapsed >= 30:
             sent_debug = True
             await notify_photo(zp, f"⏳ Waiting to enter Zoom ({mask_url(zp.url)})")
-        # Still on the pre-join screen? press Join again.
-        if elapsed >= 25 and not repressed and not WAITING_ROOM_RE.search(text):
-            repressed = True
-            await click_prejoin_join(zp)
+        # Wait quietly without re-clicking (re-clicking pre-join invalidates single-use token)
         await asyncio.sleep(2)
     await notify_photo(zp, "⚠️ Could not confirm the meeting UI")
     raise RuntimeError("Could not confirm that the Zoom meeting was joined; not recording")
@@ -2173,7 +2183,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-25a (IST browser timezone + robust join-from-browser)")
+        log("Recorder build 2026-11-25b (direct-fallback web client + single pre-join click)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
