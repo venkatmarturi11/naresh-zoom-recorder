@@ -1,12 +1,13 @@
 FROM mcr.microsoft.com/playwright/python:v1.48.0-noble
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Kolkata \
     DISPLAY=:99 \
     PYTHONUNBUFFERED=1 \
     PULSE_RUNTIME_PATH=/tmp/pulse \
     PIP_BREAK_SYSTEM_PACKAGES=1
 
-# Virtual display, virtual audio, encoder, cursor hiding
+# Virtual display, virtual audio, encoder, cursor hiding, timezone
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         pulseaudio \
@@ -18,6 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         build-essential \
         python3-dev \
+        tzdata \
+    && ln -snf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime \
+    && echo "Asia/Kolkata" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

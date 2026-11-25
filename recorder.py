@@ -34,6 +34,13 @@ try:
 except Exception:  # dotenv is only a convenience for local runs
     pass
 
+# Force IST timezone for the process so the browser and datetime.now() agree
+os.environ["TZ"] = "Asia/Kolkata"
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows doesn't have tzset
+
 from playwright.async_api import TimeoutError as PWTimeout
 from playwright.async_api import async_playwright
 
@@ -1321,33 +1328,89 @@ async def click_join(context, page, btn, wait_sec: int = 25):
 # State 4: Zoom web client, strictly no mic / no video
 # --------------------------------------------------------------------------
 async def click_browser_join(zp) -> bool:
-    """Click 'Join from browser'. Every Playwright call is bounded so a frozen launch
-    page can never eat the whole to_web_client deadline."""
+    """Click 'Join from browser'. If clicking doesn't trigger navigation,
+    extract the href from the <a> tag and navigate explicitly.
+    Every Playwright call is bounded so a frozen launch page can never eat
+    the whole to_web_client deadline."""
     pat = re.compile(r"join from (your )?browser", re.I)
+    url_before = zp.url
+
+    # Strategy 1: find and click the visible button/link
     for frame in zp.frames:
-        for r in ("button", "link"):
+        for r in ("link", "button"):
             try:
                 loc = frame.get_by_role(r, name=pat).first
                 if await asyncio.wait_for(loc.count(), 2) > 0 and await asyncio.wait_for(loc.is_visible(), 2):
+                    # If it's an <a>, grab href first so we can follow it if click fails
+                    href = None
+                    try:
+                        tag = await loc.evaluate("el => el.tagName.toLowerCase()")
+                        if tag == "a":
+                            href = await loc.get_attribute("href", timeout=2000)
+                            if href and href.startswith("/"):
+                                href = urllib.parse.urljoin(zp.url, href)
+                    except Exception:
+                        pass
+
                     await loc.click(force=True, timeout=2500)
+                    await asyncio.sleep(1.5)
+
+                    # Check if the click actually navigated
+                    if zp.url != url_before:
+                        return True
+
+                    # If click didn't navigate but we have the href, go there explicitly
+                    if href and href.startswith("http") and _is_zoom_host(href):
+                        log(f"Click didn't navigate; following href directly: {mask_url(href)}")
+                        try:
+                            await zp.goto(href, wait_until="commit", timeout=15000)
+                        except Exception:
+                            pass
                     return True
             except Exception:
                 pass
+
+    # Strategy 2: broader locator search
+    for frame in zp.frames:
         try:
             loc = frame.locator("a, button, [role='button']").filter(has_text=pat).first
             if await asyncio.wait_for(loc.count(), 3) > 0:
+                # Try to get the href before clicking
+                href = None
                 try:
-                    await loc.click(force=True, timeout=2500)  # click() scrolls into view itself
+                    href = await loc.evaluate("""el => {
+                        const a = el.closest('a') || (el.tagName === 'A' ? el : null);
+                        return a ? a.href : null;
+                    }""")
                 except Exception:
-                    await asyncio.wait_for(loc.evaluate("""b => {
-                        b.scrollIntoView();
-                        b.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
-                        b.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
-                        b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                        b.click();
-                        const a = b.closest('a');
-                        if (a && a.href && !a.href.startsWith('javascript:')) window.location.href = a.href;
-                    }"""), 3)
+                    pass
+
+                try:
+                    await loc.click(force=True, timeout=2500)
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    # DOM dispatch fallback
+                    try:
+                        await asyncio.wait_for(loc.evaluate("""b => {
+                            b.scrollIntoView();
+                            b.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                            b.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                            b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                            b.click();
+                            const a = b.closest('a');
+                            if (a && a.href && !a.href.startsWith('javascript:')) window.location.href = a.href;
+                        }"""), 3)
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+
+                # If click didn't navigate but we have the href, go there
+                if zp.url == url_before and href and href.startswith("http") and _is_zoom_host(href):
+                    log(f"Click didn't navigate; following href directly: {mask_url(href)}")
+                    try:
+                        await zp.goto(href, wait_until="commit", timeout=15000)
+                    except Exception:
+                        pass
                 return True
         except Exception:
             continue
@@ -1517,6 +1580,20 @@ async def to_web_client(context, zp):
     log(f"Preserving exact portal Zoom link (zero URL rewriting): {mask_url(orig_url)}")
     await asyncio.sleep(2)       # let the launch page finish initial render
 
+    # Dismiss the "Did not open Zoom Workplace app?" tooltip that can overlay buttons
+    for frame in zp.frames:
+        try:
+            close_btns = frame.locator("button[aria-label*='close' i], button[aria-label*='dismiss' i], .close, [class*='close']")
+            cnt = await close_btns.count()
+            for i in range(min(cnt, 3)):
+                b = close_btns.nth(i)
+                txt = (await b.inner_text(timeout=500) or "").strip().lower()
+                if txt not in ("leave", "end", "exit"):
+                    await b.click(force=True, timeout=500)
+                    await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
     while time.monotonic() < deadline:
         found = await _has_webclient(context, zp)
         if found:
@@ -1557,14 +1634,20 @@ async def to_web_client(context, zp):
             continue
 
         # In-page 'Join from browser' click
-        if clicks < 4 and time.monotonic() - last_click > (0 if clicks == 0 else 12):
+        if clicks < 4 and time.monotonic() - last_click > (0 if clicks == 0 else 15):
             if await click_browser_join(zp):
                 clicks += 1
                 last_click = time.monotonic()
                 log(f"Clicked 'Join from browser' (attempt {clicks})")
-                for _ in range(8):
+                # Wait up to 15 seconds for the web client to appear
+                for _ in range(15):
                     await asyncio.sleep(1)
-                    if await _has_webclient(context, zp):
+                    found = await _has_webclient(context, zp)
+                    if found:
+                        break
+                    # Check if the URL changed to /wc/ (web client loading)
+                    if "/wc/" in zp.url:
+                        log(f"URL changed to web client path: {mask_url(zp.url)}")
                         break
                 continue
             href = await browser_join_href(zp)
@@ -2090,7 +2173,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-24d (current-time live card auto-discovery)")
+        log("Recorder build 2026-11-25a (IST browser timezone + robust join-from-browser)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -2105,6 +2188,8 @@ async def main() -> int:
             context = await pw.chromium.launch_persistent_context(
                 str(prof_dir),
                 headless=False,
+                timezone_id="Asia/Kolkata",
+                locale="en-IN",
                 args=CHROMIUM_ARGS,
                 ignore_default_args=["--enable-automation"],
                 permissions=[],
@@ -2130,10 +2215,13 @@ async def main() -> int:
                 "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
             )
 
-            # --- Block zoommtg:// and Zoom signin/register routes at the network layer ---
+            # --- Block zoommtg:// and external OAuth / social-login providers at the network layer ---
+            # Only block EXTERNAL login providers. Do NOT block zoom.us/signin or zoom.us/wc paths
+            # because Zoom sometimes routes /wc/ join through brief signin redirects that resolve
+            # automatically when the tk= token is valid.
             SIGNIN_ABORT_RE = re.compile(
-                r"(facebook\.com|accounts\.google\.com|appleid\.apple\.com|"
-                r"zoom\.[a-z]+/(signin|signup|register|google_oauth|fb_oauth|apple_oauth|sso|oauth))", re.I
+                r"(facebook\.com/login|accounts\.google\.com|appleid\.apple\.com|"
+                r"login\.microsoftonline\.com)", re.I
             )
             async def _abort_route(route):
                 await route.abort()

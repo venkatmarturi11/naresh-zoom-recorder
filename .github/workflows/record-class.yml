@@ -73,6 +73,7 @@ jobs:
             -v "$PWD/out:/out" \
             -e RECORD_PATH=/out/class_recording.mp4 \
             -e STEP_SUMMARY_PATH=/out/step_summary.md \
+            -e TZ=Asia/Kolkata \
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
             -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
