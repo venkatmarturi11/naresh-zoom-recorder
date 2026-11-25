@@ -12,61 +12,6 @@
   if (window.__popupGuardInstalled) return;
   window.__popupGuardInstalled = true;
 
-  // --- Anti-Bot & WebGL Hardware Stealth ---
-  try {
-    const getParamHandler = {
-      apply: function(target, ctx, args) {
-        const p = args[0];
-        // 37445: UNMASKED_VENDOR_WEBGL
-        if (p === 37445) return 'Google Inc. (NVIDIA)';
-        // 37446: UNMASKED_RENDERER_WEBGL (Masks Linux llvmpipe / software rasterizer)
-        if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-        return Reflect.apply(target, ctx, args);
-      }
-    };
-    if (typeof WebGLRenderingContext !== 'undefined') {
-      WebGLRenderingContext.prototype.getParameter = new Proxy(WebGLRenderingContext.prototype.getParameter, getParamHandler);
-    }
-    if (typeof WebGL2RenderingContext !== 'undefined') {
-      WebGL2RenderingContext.prototype.getParameter = new Proxy(WebGL2RenderingContext.prototype.getParameter, getParamHandler);
-    }
-  } catch(e) {}
-
-  try {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
-  } catch(e) {}
-
-  try {
-    const fakePlugins = [
-      { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-      { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-      { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-    ];
-    Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins });
-  } catch(e) {}
-
-  try {
-    window.chrome = window.chrome || { runtime: {} };
-    window.chrome.app = window.chrome.app || { isInstalled: false };
-    window.chrome.csi = window.chrome.csi || function() {};
-    window.chrome.loadTimes = window.chrome.loadTimes || function() {};
-  } catch(e) {}
-
-  try {
-    const oq = navigator.permissions && navigator.permissions.query;
-    if (oq) {
-      navigator.permissions.query = (p) => (
-        (p && (p.name === 'microphone' || p.name === 'camera'))
-          ? Promise.resolve({ state: 'granted' })
-          : oq.call(navigator.permissions, p)
-      );
-    }
-  } catch(e) {}
-
   const host = location.hostname || "";
   const isZoom = /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(host);
 
@@ -148,42 +93,63 @@
     return String(c && c.baseVal !== undefined ? c.baseVal : c || "");
   };
 
-  function dismissOnce() {
-    ensureCss();
-    let n = 0;
-    let list;
-    try { list = document.querySelectorAll(CONTAINERS); } catch (e) { return 0; }
-    const clicked = new Set();
-    for (const c of list) {
-      try {
-        if (!visible(c)) continue;
-        const text = String(c.innerText || "").trim();
-        if (text.length > 700) continue;           // big layout area, not a popup
-        if (PROTECT.test(text)) continue;          // never touch these
-        if (c.querySelector(FIELDS)) continue;     // forms / name / passcode inputs
-        const btns = Array.from(c.querySelectorAll(BUTTONS)).filter(visible);
-        if (!btns.length) continue;
-        let t = btns.find((b) => SAFE.test(label(b)));
-        if (!t && /record/i.test(text)) t = btns.find((b) => CONSENT.test(label(b)));
-        if (!t) t = btns.find((b) => CLOSE.test(label(b)) || /(^|[\s_-])close([\s_-]|$)/i.test(cls(b)));
-        if (t && !clicked.has(t)) { clicked.add(t); t.click(); n++; }
-      } catch (e) { }
-    }
-    return n;
+  function dismissOne(c) {
+    try {
+      if (!visible(c)) return false;
+      const text = (c.innerText || c.textContent || "").trim();
+      if (!text && !c.querySelector(BUTTONS)) return false;
+
+      // NEVER touch dialogs that contain inputs, passcodes, name prompts, leave/end notices,
+      // or sign-in prompts (let user interact freely via remote desktop)
+      if (PROTECT.test(text) || c.querySelector(FIELDS)) return false;
+
+      const btns = Array.from(c.querySelectorAll(BUTTONS)).filter(visible);
+      for (const b of btns) {
+        const l = label(b);
+        if (SAFE.test(l)) {
+          b.click();
+          return true;
+        }
+      }
+      for (const b of btns) {
+        const l = label(b);
+        if (CONSENT.test(l)) {
+          b.click();
+          return true;
+        }
+      }
+      for (const b of btns) {
+        const l = label(b);
+        const cl = cls(b);
+        if (CLOSE.test(l) || /close|dismiss|btn-close/i.test(cl)) {
+          b.click();
+          return true;
+        }
+      }
+    } catch (e) { }
+    return false;
   }
-  window.__dismissPopups = dismissOnce;
 
-  let pending = false;
-  const schedule = () => {
-    if (pending) return;
-    pending = true;
-    setTimeout(() => { pending = false; dismissOnce(); }, 300);
-  };
+  function sweep() {
+    ensureCss();
+    try {
+      const candidates = document.querySelectorAll(CONTAINERS);
+      for (const c of candidates) {
+        dismissOne(c);
+      }
+    } catch (e) { }
+  }
 
-  ensureCss();
-  try {
-    new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
-  } catch (e) { }
-  setInterval(dismissOnce, 2000);
-  document.addEventListener("DOMContentLoaded", () => { ensureCss(); schedule(); });
+  sweep();
+  document.addEventListener("DOMContentLoaded", sweep, { passive: true });
+  window.addEventListener("load", sweep, { passive: true });
+
+  const mo = new MutationObserver(() => {
+    sweep();
+  });
+  const root = document.documentElement || document.body;
+  if (root) {
+    mo.observe(root, { childList: true, subtree: true });
+  }
+  setInterval(sweep, 1500);
 })();

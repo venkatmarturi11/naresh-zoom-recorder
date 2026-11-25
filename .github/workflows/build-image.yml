@@ -10,6 +10,8 @@ on:
       - requirements.txt
       - recorder.py
       - popup_guard.js
+      - desktop/**
+      - scripts/**
       - chromium-policy/**
       - .github/workflows/build-image.yml
   workflow_dispatch:

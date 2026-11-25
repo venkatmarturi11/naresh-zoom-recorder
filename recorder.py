@@ -169,9 +169,117 @@ SIGNIN_TEXT_RE = re.compile(
     r"enter email, zoom mail or phone number)", re.I)
 ZOOM_EMAIL = _env("ZOOM_EMAIL")
 ZOOM_PASS = _env("ZOOM_PASS")
+ZOOM_COOKIES = _env("ZOOM_COOKIES")
+ZOOM_COOKIES_FILE = _env("ZOOM_COOKIES_FILE")
+CF_TUNNEL_TOKEN = _env("CF_TUNNEL_TOKEN")
+VNC_PASSWORD = _env("VNC_PASSWORD")
+VNC_PUBLIC_URL = _env("VNC_PUBLIC_URL")
+MANUAL_JOIN_WAIT_SEC = _int_env("MANUAL_JOIN_WAIT_SEC", 600)
+
+
+def parse_session_tokens(raw_text: str) -> list:
+    """Parses exported tab-separated or JSON browser session tokens."""
+    if not raw_text or not raw_text.strip():
+        return []
+    raw = raw_text.strip()
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            arr = json.loads(raw)
+            if isinstance(arr, dict):
+                arr = [arr]
+            res = []
+            for item in arr:
+                if isinstance(item, dict) and item.get("name") and item.get("value") is not None:
+                    res.append({
+                        "name": str(item["name"]).strip(),
+                        "value": str(item["value"]).strip(),
+                        "domain": str(item.get("domain") or ".zoom.us").strip(),
+                        "path": str(item.get("path") or "/").strip(),
+                        "secure": bool(item.get("secure", True)),
+                    })
+            return res
+        except Exception:
+            pass
+
+    res = []
+    now = int(time.time())
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = line.split("\t")
+        if len(p) >= 7 and any(k in p[0].lower() for k in ("zoom", "nareshit")):
+            item = {
+                "domain": p[0].strip(),
+                "path": p[2].strip() or "/",
+                "secure": p[3].strip().upper() == "TRUE",
+                "name": p[5].strip(),
+                "value": p[6].strip(),
+            }
+            try:
+                exp = int(float(p[4].strip()))
+                if exp > now:
+                    item["expires"] = exp
+            except Exception:
+                pass
+            res.append(item)
+    return res
+
+
+async def setup_zoom_session(context) -> int:
+    """Injects user authentication session tokens into browser context before join."""
+    cookie_text = ""
+    source = ""
+
+    candidate_paths = []
+    if ZOOM_COOKIES_FILE:
+        candidate_paths.append(Path(ZOOM_COOKIES_FILE))
+    candidate_paths.extend([
+        Path("/out/zoom_cookies.txt"),
+        Path("/tmp/zoom_cookies.txt"),
+        Path("zoom_cookies.txt"),
+    ])
+
+    for cp in candidate_paths:
+        try:
+            if cp.exists() and cp.is_file() and cp.stat().st_size > 0:
+                cookie_text = cp.read_text(encoding="utf-8", errors="ignore")
+                source = str(cp)
+                break
+        except Exception:
+            pass
+
+    if not cookie_text and ZOOM_COOKIES:
+        cookie_text = ZOOM_COOKIES
+        source = "ZOOM_COOKIES secret"
+
+    if not cookie_text.strip():
+        log("ℹ️ No Zoom session credentials configured (using normal browser session)")
+        return 0
+
+    tokens = parse_session_tokens(cookie_text)
+    if not tokens:
+        log(f"⚠️ Could not parse tokens from {source}")
+        return 0
+
+    loaded = 0
+    try:
+        await context.add_cookies(tokens)
+        loaded = len(tokens)
+    except Exception:
+        for t in tokens:
+            try:
+                await context.add_cookies([t])
+                loaded += 1
+            except Exception:
+                pass
+
+    if loaded > 0:
+        log(f"🔑 Applied {loaded} session tokens into browser context (from {source})")
+        step.record("Zoom Auth", "🔑", f"Applied {loaded} session tokens from {source}")
+    return loaded
 
 HIDE_CSS = """
-* { cursor: none !important; }
 #wc-footer, #foot-bar, .footer-bar, .footer__inner, .meeting-info-container,
 .zm-notification, [class*='toast'], [class*='Toast'], [class*='notification'],
 [class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'] {
@@ -187,8 +295,7 @@ CHROMIUM_ARGS = [
     "--use-fake-device-for-media-stream",
     "--window-size=1920,1080",
     "--window-position=0,0",
-    "--kiosk",
-    "--start-fullscreen",
+    "--start-maximized",
     "--disable-infobars",
     "--disable-notifications",
     "--autoplay-policy=no-user-gesture-required",
@@ -215,10 +322,12 @@ class StepTracker:
         if not self.path:
             return
         time_disp = (CLASS_START or 'Immediate') + " IST"
+        vnc_line = f"- **🖥️ Remote Desktop (noVNC):** [{VNC_PUBLIC_URL}]({VNC_PUBLIC_URL})\n" if VNC_PUBLIC_URL else ""
         header = (
             f"## 🎥 Zoom Class Recording Summary\n\n"
             f"- **Class Name:** `{ACTIVE_CLASS_TITLE}`\n"
             f"- **Class Time:** `{time_disp}`" + (f" - `{CLASS_END} IST`" if CLASS_END else "") + "\n"
+            f"{vnc_line}"
             f"- **Date:** `{datetime.now(IST).strftime('%Y-%m-%d')}`\n\n"
             f"| Step | Status | Time (IST) | Details |\n"
             f"| :--- | :---: | :---: | :--- |\n"
@@ -457,6 +566,8 @@ class MediaStack:
     def __init__(self):
         self.xvfb = None
         self.unclutter = None
+        self.started_xvfb = False
+        self.started_pulse = False
 
     def start(self) -> None:
         os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/xdg-runtime")
@@ -465,24 +576,21 @@ class MediaStack:
             os.makedirs(os.environ[key], mode=0o700, exist_ok=True)
         os.environ["DISPLAY"] = DISPLAY
 
-        # PulseAudio with a null sink that Chromium plays into
-        sh(["pulseaudio", "-D", "--exit-idle-time=-1"])
-        for _ in range(30):
-            if sh(["pactl", "info"]).returncode == 0:
-                break
-            time.sleep(0.5)
-        else:
-            raise RuntimeError("PulseAudio did not start")
+        # Check if PulseAudio is already running (e.g. from start-audio.sh)
+        if sh(["pactl", "info"]).returncode != 0:
+            sh(["pulseaudio", "-D", "--exit-idle-time=-1"])
+            for _ in range(30):
+                if sh(["pactl", "info"]).returncode == 0:
+                    self.started_pulse = True
+                    break
+                time.sleep(0.5)
+
         sh([
             "pactl", "load-module", "module-null-sink",
             f"sink_name={SINK}", f"sink_properties=device.description={SINK}",
         ])
         sh(["pactl", "set-default-sink", SINK])
-        if SINK not in sh(["pactl", "list", "short", "sinks"]).stdout:
-            raise RuntimeError("Virtual audio sink was not created")
 
-        # Virtual microphone source so Chromium / Zoom WebRTC audio engine
-        # always detects an available audio input device
         try:
             sh([
                 "pactl", "load-module", "module-null-sink",
@@ -492,32 +600,33 @@ class MediaStack:
         except Exception:
             pass
 
-        # Virtual 1080p display
-        self.xvfb = subprocess.Popen(
-            ["Xvfb", DISPLAY, "-screen", "0", "1920x1080x24", "-ac",
-             "+extension", "GLX", "+render", "-noreset"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        for _ in range(40):
-            if sh(["xdpyinfo", "-display", DISPLAY]).returncode == 0:
-                break
-            time.sleep(0.25)
-        else:
-            raise RuntimeError("Xvfb did not start")
+        # Check if Xvfb is already running (e.g. from start-desktop.sh)
+        if sh(["xdpyinfo", "-display", DISPLAY]).returncode != 0:
+            self.xvfb = subprocess.Popen(
+                ["Xvfb", DISPLAY, "-screen", "0", "1920x1080x24", "-ac",
+                 "+extension", "GLX", "+render", "-noreset"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            for _ in range(40):
+                if sh(["xdpyinfo", "-display", DISPLAY]).returncode == 0:
+                    self.started_xvfb = True
+                    break
+                time.sleep(0.25)
 
-        # Hide the mouse cursor (non-fatal if unavailable)
+        # Hide cursor when idle (cursor remains visible on touch / mouse move)
         try:
             self.unclutter = subprocess.Popen(
-                ["unclutter", "-idle", "0.2", "-root"],
+                ["unclutter", "-idle", "1.0", "-root"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except Exception:
             self.unclutter = None
 
     def stop(self) -> None:
-        for proc in (self.unclutter, self.xvfb):
-            if proc and proc.poll() is None:
-                proc.terminate()
+        if self.unclutter and self.unclutter.poll() is None:
+            self.unclutter.terminate()
+        if self.started_xvfb and self.xvfb and self.xvfb.poll() is None:
+            self.xvfb.terminate()
 
 
 # --------------------------------------------------------------------------
@@ -1867,89 +1976,172 @@ async def dismiss_popups(zp) -> None:
             continue
 
 
-async def in_meeting(zp) -> bool:
+async def is_meeting_admitted(zp) -> bool:
+    """
+    Returns True ONLY when actually admitted inside the Zoom meeting room.
+    Uses multiple reliable indicators:
+    - Verifies URL is on web client (/wc/ or /j/)
+    - Excludes pre-join screen, bot wall, sign-in wall, and waiting room
+    - Requires active meeting toolbar controls or live video/canvas elements
+    """
     try:
-        if not _is_zoom_host(zp.url) or SIGNIN_URL_RE.search(zp.url):
+        url = zp.url.lower()
+        if not _is_zoom_host(url) or SIGNIN_URL_RE.search(url):
             return False
-        await asyncio.wait_for(zp.mouse.move(960, 1040), 3)
+
+        # Exclude pre-join screen, bot blocker, waiting room
+        text = await page_text(zp)
+        if "automated bots aren't allowed" in text.lower():
+            return False
+        if WAITING_ROOM_RE.search(text):
+            return False
+        if "sign in to join" in text.lower() and "leave" not in text.lower():
+            return False
+
+        for frame in zp.frames:
+            try:
+                pj = frame.locator("button.preview-join-button, input#input-for-name, .preview-video, .join-dialog").first
+                if await pj.count() and await pj.is_visible():
+                    return False
+            except Exception:
+                continue
+
+        # Check for multiple positive indicators of active meeting admission
+        has_canvas = False
+        has_controls = False
+
+        for frame in zp.frames:
+            try:
+                canvas = frame.locator(
+                    "canvas.main-canvas, canvas#main-canvas, canvas.share-screen-canvas, "
+                    ".video-avatar__avatar, canvas[id*='speaker' i], .meeting-app, #meeting-app"
+                ).first
+                if await canvas.count() and await canvas.is_visible():
+                    has_canvas = True
+                    break
+            except Exception:
+                pass
+
+        for frame in zp.frames:
+            try:
+                ctrls = frame.locator(
+                    "#wc-footer, #foot-bar, .footer-bar, .footer__inner, "
+                    "button[aria-label*='Leave' i], button:has-text('Leave'), "
+                    "button[aria-label*='Participants' i], button[aria-label*='Chat' i], "
+                    "button[aria-label*='Reactions' i], button[aria-label*='Mute' i]"
+                ).first
+                if await ctrls.count() and await ctrls.is_visible():
+                    has_controls = True
+                    break
+            except Exception:
+                pass
+
+        if has_controls or (has_canvas and ("/wc/" in url or "/j/" in url)):
+            return True
+
     except Exception:
         pass
-    # still on the pre-join screen -> not in the meeting yet
-    for frame in zp.frames:
-        try:
-            pj = frame.locator("button.preview-join-button, input#input-for-name").first
-            if await pj.count() and await pj.is_visible():
-                return False
-        except Exception:
-            continue
-    for frame in zp.frames:
-        try:
-            loc = frame.locator(
-                "#wc-footer, #foot-bar, [class*='footer-chat'], "
-                "button[aria-label*='Leave' i], button:has-text('Leave'), "
-                "button[aria-label*='Participants' i], button[aria-label*='Chat' i], "
-                "button[aria-label*='Reactions' i], button[aria-label*='Share Screen' i]"
-            ).first
-            if await loc.count() and await loc.is_visible():
-                return True
-        except Exception:
-            continue
     return False
 
 
-async def wait_in_meeting(zp, max_wait: int = 300) -> None:
-    """Wait through the waiting room; start recording only once truly inside."""
+async def in_meeting(zp) -> bool:
+    return await is_meeting_admitted(zp)
+
+
+async def wait_in_meeting(zp, max_wait: int = 0) -> None:
+    """
+    Wait through pre-join, waiting room, or human verification prompt.
+    If human interaction is required (bot challenge, CAPTCHA, sign-in wall),
+    keeps VNC and browser active, alerts Telegram with VNC link, and waits
+    up to MANUAL_JOIN_WAIT_SEC for the user to complete verification.
+    Recording begins ONLY once true meeting admission is confirmed.
+    """
+    if not max_wait:
+        max_wait = MANUAL_JOIN_WAIT_SEC
+
     deadline = time.monotonic() + max_wait
     started_wait = time.monotonic()
     last_diag = -60.0
-    sent_debug = False
-    signin_tries = 0
+    human_interaction_notified = False
     stable = 0
-    repressed = False
+
+    step.record("Meeting Admission", "⏳", f"Verifying Zoom meeting admission (timeout: {max_wait}s)...")
+
     while time.monotonic() < deadline:
         text = await page_text(zp)
+
         if END_RE.search(text):
+            step.record("Meeting Admission", "🛑", "Meeting was ended by host before admission")
             raise RuntimeError("Meeting ended before the recording could start")
+
         if is_generic_join_page(zp):
             await notify_photo(zp, "⚠️ Zoom dropped to the generic Join Meeting page")
             raise RuntimeError("Zoom did not accept the meeting link (generic Join Meeting page)")
-        if await on_signin_page(zp) or re.search(r"sign-?in|sign-?up|register|login", zp.url, re.I):
-            stable = 0
-            orig = LAST_ZOOM_URL or MEETING_URL
-            if signin_tries < 5 and orig:
-                signin_tries += 1
-                log(f"🛡️ Zoom redirected to sign-in ({mask_url(zp.url)}); bouncing back to registered portal link ({signin_tries}/5)")
-                try:
-                    await zp.goto(orig, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-                await asyncio.sleep(3)
-                continue
-            if await zoom_signin(zp):
-                continue
-            await asyncio.sleep(2)
-            continue
-        await dismiss_popups(zp)
-        if await in_meeting(zp) and not WAITING_ROOM_RE.search(text):
+
+        # Check if meeting admission is confirmed
+        if await is_meeting_admitted(zp):
             stable += 1
             if stable >= 2:  # must hold for two consecutive checks
-                step.record("Meeting Status", "🎥", "Confirmed inside Zoom meeting! Ready to record")
+                step.record("Meeting Admission", "✅", "Confirmed inside Zoom meeting! Ready to record")
+                log("✅ [Meeting State] Confirmed inside Zoom meeting! Admission verified.")
+                await notify("✅ Confirmed inside Zoom meeting - starting 1080p recording")
                 return
             await asyncio.sleep(1.5)
             continue
         stable = 0
+
+        # Check if human interaction is required
+        url_lower = zp.url.lower()
+        is_bot_wall = "automated bots" in text.lower() or "bot" in text.lower()
+        is_signin_wall = await on_signin_page(zp) or re.search(r"sign-?in|sign-?up|register|login", url_lower)
+        is_waiting_room = bool(WAITING_ROOM_RE.search(text))
+        is_captcha = "recaptcha" in text.lower() or "challenge" in text.lower()
+
+        needs_human = is_bot_wall or is_signin_wall or is_waiting_room or is_captcha
+
+        if needs_human and not human_interaction_notified:
+            human_interaction_notified = True
+            vnc_url = VNC_PUBLIC_URL or "http://127.0.0.1:6080"
+            if is_bot_wall:
+                reason = "Bot verification challenge presented by Zoom"
+            elif is_signin_wall:
+                reason = "Zoom requested account sign-in"
+            elif is_waiting_room:
+                reason = "In Zoom waiting room (waiting for host)"
+            elif is_captcha:
+                reason = "Zoom security CAPTCHA challenge"
+            else:
+                reason = "Manual interaction required"
+
+            log(f"⚠️ [Meeting State] Human interaction required: {reason}")
+            log(f"🖥️ Remote Desktop available at: {vnc_url}")
+            step.record("Human Interaction", "⚠️", f"{reason}. Connect via Remote Desktop: {vnc_url}")
+
+            alert_msg = (
+                f"⚠️ Action Required: {reason}!\n\n"
+                f"Zoom requires user interaction to join the meeting.\n"
+                f"🖥️ Remote Desktop: {vnc_url}\n\n"
+                f"Open this link in your mobile or laptop browser to interact with Chrome and join."
+            )
+            await notify(alert_msg)
+            await notify_photo(zp, f"⚠️ Action Required: {reason}")
+
+        await dismiss_popups(zp)
+
         elapsed = time.monotonic() - started_wait
         if elapsed - last_diag >= 30:
             last_diag = elapsed
-            snippet = re.sub(r"\s+", " ", text).strip()[:160]
-            log(f"Waiting for meeting UI ({mask_url(zp.url)}): {snippet}")
-        if not sent_debug and elapsed >= 30:
-            sent_debug = True
-            await notify_photo(zp, f"⏳ Waiting to enter Zoom ({mask_url(zp.url)})")
-        # Wait quietly without re-clicking (re-clicking pre-join invalidates single-use token)
+            remaining = int(deadline - time.monotonic())
+            snippet = re.sub(r"\s+", " ", text).strip()[:140]
+            vnc_info = f" | Remote Desktop: {VNC_PUBLIC_URL}" if VNC_PUBLIC_URL else ""
+            log(f"Waiting for meeting admission ({remaining}s remaining{vnc_info}): {snippet}")
+
+        # Keep browser open and alive for human interaction through noVNC
         await asyncio.sleep(2)
-    await notify_photo(zp, "⚠️ Could not confirm the meeting UI")
-    raise RuntimeError("Could not confirm that the Zoom meeting was joined; not recording")
+
+    await notify_photo(zp, "❌ Could not confirm meeting admission within timeout")
+    step.record("Meeting Admission", "❌", f"Timed out after {max_wait}s waiting for meeting admission")
+    raise RuntimeError(f"Could not confirm that the Zoom meeting was joined within {max_wait}s timeout")
 
 
 async def join_audio(zp) -> None:
@@ -2201,7 +2393,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-25d (stealth WebGL GPU spoofing + Windows UA + reCAPTCHA evasion)")
+        log("Recorder build 2026-11-25f (remote desktop vnc + manual interaction support)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -2218,13 +2410,15 @@ async def main() -> int:
                 headless=False,
                 timezone_id="Asia/Kolkata",
                 locale="en-IN",
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 args=CHROMIUM_ARGS,
                 ignore_default_args=["--enable-automation"],
                 permissions=["microphone", "camera"],
                 accept_downloads=False,
                 no_viewport=True,
             )
+
+            # --- Inject authenticated Zoom session if configured -----------
+            await setup_zoom_session(context)
 
             # --- Inject popup_guard.js into every page/frame ---------------
             guard_js = Path("/app/popup_guard.js")
@@ -2236,52 +2430,8 @@ async def main() -> int:
             else:
                 log("popup_guard.js not found; skipping in-page popup guard")
 
-            # --- Stealth + zoommtg:// blocker init script ------------------
+            # --- Block desktop-app zoommtg:// protocol loop ----------------
             await context.add_init_script("""
-                try {
-                    const getParamHandler = {
-                        apply: function(target, ctx, args) {
-                            const p = args[0];
-                            if (p === 37445) return 'Google Inc. (NVIDIA)';
-                            if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                            return Reflect.apply(target, ctx, args);
-                        }
-                    };
-                    if (typeof WebGLRenderingContext !== 'undefined') {
-                        WebGLRenderingContext.prototype.getParameter = new Proxy(WebGLRenderingContext.prototype.getParameter, getParamHandler);
-                    }
-                    if (typeof WebGL2RenderingContext !== 'undefined') {
-                        WebGL2RenderingContext.prototype.getParameter = new Proxy(WebGL2RenderingContext.prototype.getParameter, getParamHandler);
-                    }
-                } catch(e) {}
-                try {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
-                } catch(e) {}
-                try {
-                    const fakePlugins = [
-                        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-                    ];
-                    Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins });
-                } catch(e) {}
-                try {
-                    window.chrome = window.chrome || { runtime: {} };
-                } catch(e) {}
-                try {
-                    const oq = navigator.permissions && navigator.permissions.query;
-                    if (oq) {
-                        navigator.permissions.query = (p) => (
-                            (p && (p.name === 'microphone' || p.name === 'camera'))
-                                ? Promise.resolve({ state: 'granted' })
-                                : oq.call(navigator.permissions, p)
-                        );
-                    }
-                } catch(e) {}
                 const _open=window.open;window.open=(u,...a)=>(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));
             """)
 
@@ -2361,7 +2511,7 @@ async def main() -> int:
 
                 zoom_page = await to_web_client(context, zoom_page)
                 await zoom_prejoin(zoom_page)
-                await wait_in_meeting(zoom_page)
+                await wait_in_meeting(zoom_page, max_wait=MANUAL_JOIN_WAIT_SEC)
                 await join_audio(zoom_page)
                 dismiss_browser_prompt()
                 await notify_photo(zoom_page, "📸 Joined the meeting - recording starts now")

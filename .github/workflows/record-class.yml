@@ -22,6 +22,10 @@ on:
         description: "Class duration in minutes"
         required: false
         default: ""
+      manual_join_wait_sec:
+        description: "Seconds to wait for manual human interaction if Zoom requires it (default: 600)"
+        required: false
+        default: "600"
 
 permissions:
   contents: read
@@ -44,7 +48,7 @@ jobs:
       - name: Pull pre-built image
         run: docker pull -q "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
 
-      - name: Record class and upload to Telegram
+      - name: Record class, enable remote desktop & upload to Telegram
         env:
           PORTAL_URL: ${{ secrets.PORTAL_URL }}
           PORTAL_USER: ${{ secrets.PORTAL_USER }}
@@ -62,28 +66,72 @@ jobs:
           PARTICIPANT_NAME: ${{ vars.PARTICIPANT_NAME }}
           ZOOM_EMAIL: ${{ secrets.ZOOM_EMAIL }}
           ZOOM_PASS: ${{ secrets.ZOOM_PASS }}
+          ZOOM_COOKIES: ${{ secrets.ZOOM_COOKIES }}
           MAX_WAIT_MIN: ${{ vars.MAX_WAIT_MIN }}
           MAX_MEETING_SEC: ${{ vars.MAX_MEETING_SEC }}
           ALLOWED_HOSTS: ${{ vars.ALLOWED_HOSTS }}
           BLOCK_TRACKERS: ${{ vars.BLOCK_TRACKERS }}
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          VNC_PUBLIC_URL: ${{ vars.VNC_PUBLIC_URL }}
+          MANUAL_JOIN_WAIT_SEC: ${{ inputs.manual_join_wait_sec || vars.MANUAL_JOIN_WAIT_SEC || '600' }}
         run: |
           mkdir -p out && chmod 777 out
           touch out/step_summary.md && chmod 666 out/step_summary.md
+
+          if [ -n "$ZOOM_COOKIES" ]; then
+            printf "%s" "$ZOOM_COOKIES" > out/zoom_cookies.txt
+            chmod 600 out/zoom_cookies.txt
+          fi
+
+          if [ -n "$VNC_PUBLIC_URL" ]; then
+            echo "### 🖥️ Remote Desktop Access (noVNC)" >> out/step_summary.md
+            echo "- **Live Browser Access:** [Open Remote Desktop]($VNC_PUBLIC_URL)" >> out/step_summary.md
+            echo "- *Use your phone or laptop browser to watch or complete Zoom human verification.*" >> out/step_summary.md
+            echo "" >> out/step_summary.md
+          fi
+
           docker run --rm --init --shm-size=2g \
+            -p 127.0.0.1:6080:6080 \
             -v "$PWD/out:/out" \
             -e RECORD_PATH=/out/class_recording.mp4 \
             -e STEP_SUMMARY_PATH=/out/step_summary.md \
+            -e ZOOM_COOKIES_FILE=/out/zoom_cookies.txt \
             -e TZ=Asia/Kolkata \
             -e PORTAL_URL -e PORTAL_USER -e PORTAL_PASS \
             -e TG_API_ID -e TG_API_HASH -e TG_BOT_TOKEN -e TG_CHAT_ID \
             -e CLASS_KEYWORD -e CLASS_START -e CLASS_END -e CLASS_DURATION_MIN \
             -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME -e ZOOM_EMAIL -e ZOOM_PASS \
+            -e ZOOM_COOKIES \
             -e MAX_WAIT_MIN -e MAX_MEETING_SEC -e ALLOWED_HOSTS -e BLOCK_TRACKERS \
+            -e CF_TUNNEL_TOKEN -e VNC_PASSWORD -e VNC_PUBLIC_URL -e MANUAL_JOIN_WAIT_SEC \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
 
-      - name: Publish Step Summary to GitHub Page
+      - name: Publish Step Summary to GitHub Job
         if: always()
         run: |
           if [ -f out/step_summary.md ]; then
             cat out/step_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Upload Recording MP4 Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: class-recording
+          path: out/*.mp4
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload Diagnostic Logs and Step Summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-diagnostics
+          path: |
+            out/*.md
+            out/*.txt
+            out/*.log
+            /tmp/*.log
+          retention-days: 7
+          if-no-files-found: ignore
