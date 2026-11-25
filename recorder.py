@@ -1803,6 +1803,21 @@ async def zoom_prejoin(zp) -> None:
             except Exception:
                 continue
 
+        for frame in zp.frames:
+            try:
+                signin_btn = frame.locator("button:has-text('Sign in to join'), a:has-text('Sign in to join')").first
+                if await signin_btn.count() and await signin_btn.is_visible():
+                    if ZOOM_EMAIL and ZOOM_PASS:
+                        step.record("Zoom Pre-Join", "🔑", "Bot check requested sign-in; signing in with ZOOM_EMAIL")
+                        await signin_btn.click()
+                        await asyncio.sleep(2)
+                        if await zoom_signin(zp):
+                            return
+                    else:
+                        log("⚠️ Zoom presented 'Sign in to join' wall (host requires authentication or reCAPTCHA triggered)")
+            except Exception:
+                pass
+
         if await click_prejoin_join(zp):
             clicked_join = True
             step.record("Zoom Pre-Join", "🚀", "Clicked Zoom pre-join 'Join' button")
@@ -2186,7 +2201,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-25c (auto-granted mic/cam permissions + stealth)")
+        log("Recorder build 2026-11-25d (stealth WebGL GPU spoofing + Windows UA + reCAPTCHA evasion)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -2203,6 +2218,7 @@ async def main() -> int:
                 headless=False,
                 timezone_id="Asia/Kolkata",
                 locale="en-IN",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 args=CHROMIUM_ARGS,
                 ignore_default_args=["--enable-automation"],
                 permissions=["microphone", "camera"],
@@ -2221,16 +2237,53 @@ async def main() -> int:
                 log("popup_guard.js not found; skipping in-page popup guard")
 
             # --- Stealth + zoommtg:// blocker init script ------------------
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-                "window.chrome = window.chrome || { runtime: {} };"
-                "Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });"
-                "Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });"
-                "try { const oq = navigator.permissions.query; navigator.permissions.query = (p) => "
-                "(p.name === 'microphone' || p.name === 'camera' ? Promise.resolve({ state: 'granted' }) : oq(p)); } catch(e){};"
-                "const _open=window.open;window.open=(u,...a)=>"
-                "(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));"
-            )
+            await context.add_init_script("""
+                try {
+                    const getParamHandler = {
+                        apply: function(target, ctx, args) {
+                            const p = args[0];
+                            if (p === 37445) return 'Google Inc. (NVIDIA)';
+                            if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                            return Reflect.apply(target, ctx, args);
+                        }
+                    };
+                    if (typeof WebGLRenderingContext !== 'undefined') {
+                        WebGLRenderingContext.prototype.getParameter = new Proxy(WebGLRenderingContext.prototype.getParameter, getParamHandler);
+                    }
+                    if (typeof WebGL2RenderingContext !== 'undefined') {
+                        WebGL2RenderingContext.prototype.getParameter = new Proxy(WebGL2RenderingContext.prototype.getParameter, getParamHandler);
+                    }
+                } catch(e) {}
+                try {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
+                } catch(e) {}
+                try {
+                    const fakePlugins = [
+                        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+                    ];
+                    Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins });
+                } catch(e) {}
+                try {
+                    window.chrome = window.chrome || { runtime: {} };
+                } catch(e) {}
+                try {
+                    const oq = navigator.permissions && navigator.permissions.query;
+                    if (oq) {
+                        navigator.permissions.query = (p) => (
+                            (p && (p.name === 'microphone' || p.name === 'camera'))
+                                ? Promise.resolve({ state: 'granted' })
+                                : oq.call(navigator.permissions, p)
+                        );
+                    }
+                } catch(e) {}
+                const _open=window.open;window.open=(u,...a)=>(u&&/^zoom(mtg|us)?:/i.test(String(u))?null:_open.call(window,u,...a));
+            """)
 
             # --- Block zoommtg:// and external OAuth / social-login providers at the network layer ---
             # Only block EXTERNAL login providers. Do NOT block zoom.us/signin or zoom.us/wc paths

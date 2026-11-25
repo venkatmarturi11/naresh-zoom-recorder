@@ -6,5 +6,7 @@
   "DefaultMediaStreamSetting": 1,
   "AudioCaptureAllowed": true,
   "VideoCaptureAllowed": true,
-  "AudioCaptureAllowedUrls": ["https://*.zoom.us"]
+  "AudioCaptureAllowedUrls": [
+    "https://*.zoom.us"
+  ]
 }

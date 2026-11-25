@@ -12,6 +12,61 @@
   if (window.__popupGuardInstalled) return;
   window.__popupGuardInstalled = true;
 
+  // --- Anti-Bot & WebGL Hardware Stealth ---
+  try {
+    const getParamHandler = {
+      apply: function(target, ctx, args) {
+        const p = args[0];
+        // 37445: UNMASKED_VENDOR_WEBGL
+        if (p === 37445) return 'Google Inc. (NVIDIA)';
+        // 37446: UNMASKED_RENDERER_WEBGL (Masks Linux llvmpipe / software rasterizer)
+        if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return Reflect.apply(target, ctx, args);
+      }
+    };
+    if (typeof WebGLRenderingContext !== 'undefined') {
+      WebGLRenderingContext.prototype.getParameter = new Proxy(WebGLRenderingContext.prototype.getParameter, getParamHandler);
+    }
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+      WebGL2RenderingContext.prototype.getParameter = new Proxy(WebGL2RenderingContext.prototype.getParameter, getParamHandler);
+    }
+  } catch(e) {}
+
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
+  } catch(e) {}
+
+  try {
+    const fakePlugins = [
+      { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+      { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+      { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+    ];
+    Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins });
+  } catch(e) {}
+
+  try {
+    window.chrome = window.chrome || { runtime: {} };
+    window.chrome.app = window.chrome.app || { isInstalled: false };
+    window.chrome.csi = window.chrome.csi || function() {};
+    window.chrome.loadTimes = window.chrome.loadTimes || function() {};
+  } catch(e) {}
+
+  try {
+    const oq = navigator.permissions && navigator.permissions.query;
+    if (oq) {
+      navigator.permissions.query = (p) => (
+        (p && (p.name === 'microphone' || p.name === 'camera'))
+          ? Promise.resolve({ state: 'granted' })
+          : oq.call(navigator.permissions, p)
+      );
+    }
+  } catch(e) {}
+
   const host = location.hostname || "";
   const isZoom = /(^|\.)zoom(gov)?\.(us|com|cn)$/i.test(host);
 
