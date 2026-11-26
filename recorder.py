@@ -324,34 +324,15 @@ class HumanCursor:
                 return False
 
     async def type_text(self, page, locator, text: str) -> bool:
-        """Clicks input field and types with variable human keystroke rhythm."""
+        """Clicks input field and types with realistic human keystroke rhythm."""
         try:
-            if not await self.click(page, locator):
-                await locator.click(timeout=2000)
-
-            await asyncio.sleep(random.uniform(0.15, 0.35))
-
+            await self.click(page, locator)
+            await asyncio.sleep(random.uniform(0.12, 0.25))
             try:
-                curr_val = await locator.input_value()
-                if curr_val:
-                    await page.keyboard.press("Control+A")
-                    await asyncio.sleep(random.uniform(0.06, 0.12))
-                    await page.keyboard.press("Backspace")
-                    await asyncio.sleep(random.uniform(0.08, 0.18))
+                await locator.press_sequentially(text, delay=random.randint(45, 95))
             except Exception:
-                pass
-
-            for ch in text:
-                await page.keyboard.press(ch)
-                if ch in (" ", ".", "-", "@", "_"):
-                    delay = random.uniform(0.120, 0.240)
-                elif ch.isupper() or ch.isdigit():
-                    delay = random.uniform(0.075, 0.160)
-                else:
-                    delay = random.uniform(0.040, 0.105)
-                await asyncio.sleep(delay)
-
-            await asyncio.sleep(random.uniform(0.15, 0.30))
+                await locator.fill(text)
+            await asyncio.sleep(random.uniform(0.12, 0.25))
             return True
         except Exception:
             try:
@@ -1065,19 +1046,35 @@ async def login(page) -> None:
 
     step.record("Portal Login", "🔑", f"Entering credentials for user: {PORTAL_USER[:3]}***")
     user_field = page.locator(USER_SEL).first
-    await human_cursor.type_text(page, user_field, PORTAL_USER)
-    await human_cursor.type_text(page, pw_field, PORTAL_PASS)
+    await user_field.fill(PORTAL_USER)
+    await pw_field.fill(PORTAL_PASS)
+    await asyncio.sleep(0.5)
 
-    submitted = await click_any(page, [r"^log ?in$", r"sign ?in", r"^submit$", r"^login"])
+    submitted = False
+    for btn_sel in [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Log In")',
+        'button:has-text("Login")',
+        'button:has-text("Sign In")',
+        'button:has-text("Submit")',
+    ]:
+        try:
+            sub = page.locator(btn_sel).first
+            if await sub.count() and await sub.is_visible():
+                await sub.click(timeout=1500)
+                submitted = True
+                break
+        except Exception:
+            continue
+
+    if not submitted:
+        submitted = await click_any(page, [r"^log ?in$", r"sign ?in", r"^submit$", r"^login"])
     if not submitted:
         try:
-            sub = page.locator('button[type="submit"], input[type="submit"]').first
-            if await sub.count() and await sub.is_visible():
-                await human_cursor.click(page, sub)
-            else:
-                await pw_field.press("Enter")
-        except Exception:
             await pw_field.press("Enter")
+        except Exception:
+            pass
 
     await page.wait_for_load_state("domcontentloaded")
     await asyncio.sleep(1.0)
@@ -2663,7 +2660,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26f (HumanCursor Bézier physics + natural event dispatch)")
+        log("Recorder build 2026-11-26g (restored robust portal login + Zoom HumanCursor)")
         if MANUAL_MODE:
             log("🖥️ MANUAL MODE enabled — you control the browser, recorder only captures screen")
 
