@@ -181,32 +181,46 @@ MANUAL_MODE = _env("MANUAL_MODE", "0").lower() in ("1", "true", "yes", "manual")
 def _get_vnc_url() -> str:
     """Return the best available public VNC URL, re-reading the tunnel file if needed."""
     global VNC_PUBLIC_URL
-    if VNC_PUBLIC_URL:
+    if VNC_PUBLIC_URL and "127.0.0.1" not in VNC_PUBLIC_URL and "localhost" not in VNC_PUBLIC_URL:
         return VNC_PUBLIC_URL
     # Quick Tunnel writes the URL to /out/vnc_url.txt after startup
     try:
         vnc_txt = Path("/out/vnc_url.txt")
         if vnc_txt.exists() and vnc_txt.stat().st_size > 0:
             url = vnc_txt.read_text(encoding="utf-8").strip()
-            if url and "trycloudflare.com" in url:
+            if url and ("trycloudflare.com" in url or ("http" in url and "127.0.0.1" not in url and "localhost" not in url)):
                 VNC_PUBLIC_URL = url
                 return url
     except Exception:
         pass
-    # Last-resort: scan cloudflared log directly
-    try:
-        log_path = Path("/tmp/cloudflared.log")
-        if log_path.exists():
-            import re as _re
-            m = _re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', log_path.read_text())
-            if m:
-                url = m.group(0) + "/vnc.html?autoconnect=true&resize=scale"
-                VNC_PUBLIC_URL = url
-                Path("/out/vnc_url.txt").write_text(url, encoding="utf-8")
-                return url
-    except Exception:
-        pass
+    # Scan cloudflared logs directly
+    for log_candidate in [Path("/tmp/cloudflared.log"), Path("/out/cloudflared.log")]:
+        try:
+            if log_candidate.exists():
+                text = log_candidate.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', text)
+                if m:
+                    url = m.group(0) + "/vnc.html?autoconnect=true&resize=scale"
+                    VNC_PUBLIC_URL = url
+                    try:
+                        Path("/out/vnc_url.txt").write_text(url, encoding="utf-8")
+                    except Exception:
+                        pass
+                    return url
+        except Exception:
+            pass
     return ""  # No public URL available yet
+
+
+async def wait_for_vnc_url(timeout: float = 40.0) -> str:
+    """Poll for the public VNC URL up to timeout seconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        url = _get_vnc_url()
+        if url and url.startswith("http") and "127.0.0.1" not in url and "localhost" not in url:
+            return url
+        await asyncio.sleep(1)
+    return _get_vnc_url()
 
 
 def parse_session_tokens(raw_text: str) -> list:
@@ -2134,7 +2148,7 @@ async def wait_in_meeting(zp, max_wait: int = 0) -> None:
 
         if needs_human and not human_interaction_notified:
             human_interaction_notified = True
-            vnc_url = _get_vnc_url() or "(tunnel URL not yet available)"
+            vnc_url = await wait_for_vnc_url(timeout=15.0) or "(tunnel URL not yet available)"
             if is_bot_wall:
                 reason = "Bot verification challenge presented by Zoom"
             elif is_signin_wall:
@@ -2255,7 +2269,7 @@ async def _find_zoom_page(context):
     return None
 
 
-async def manual_wait_for_meeting(context, timeout: int):
+async def manual_wait_for_meeting(context, timeout: int, vnc_already_sent: bool = False):
     """
     Manual mode: passively poll browser tabs until the user has joined
     a Zoom meeting. No automated clicks—just detection.
@@ -2266,6 +2280,15 @@ async def manual_wait_for_meeting(context, timeout: int):
     notified_zoom_found = False
 
     while time.monotonic() < deadline:
+        # If public VNC URL wasn't sent initially, send it as soon as it appears!
+        if not vnc_already_sent:
+            current_vnc = _get_vnc_url()
+            if current_vnc and current_vnc.startswith("http"):
+                vnc_already_sent = True
+                log(f"🔗 Remote Desktop URL active: {current_vnc}")
+                step.record("Remote Desktop", "🔗", f"Web VNC ready: {current_vnc}")
+                await notify(f"🔗 Remote Desktop is ready:\n{current_vnc}\n\nOpen this link on your phone to interact with Chrome.")
+
         # Scan all tabs for Zoom meeting page
         for p in context.pages:
             try:
@@ -2516,7 +2539,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26c (manual mode + always-on quick tunnel)")
+        log("Recorder build 2026-11-26d (reliable quick tunnel delivery + manual mode)")
         if MANUAL_MODE:
             log("🖥️ MANUAL MODE enabled — you control the browser, recorder only captures screen")
 
@@ -2625,7 +2648,6 @@ async def main() -> int:
             try:
                 if MANUAL_MODE:
                     # ===== MANUAL MODE: zero automation, user drives everything =====
-                    vnc_url = _get_vnc_url()
                     step.record("Manual Mode", "🖥️", "Manual navigation mode — no automated clicks")
                     log("🖥️ MANUAL MODE: No automated portal login or Zoom joining")
                     log("🖥️ You control the browser entirely through Remote Desktop")
@@ -2639,9 +2661,22 @@ async def main() -> int:
                             pass
                         step.record("Portal Opened", "🌐", "Portal loaded — log in and join class manually")
 
+                    # Wait actively for Quick Tunnel URL (up to 40 seconds)
+                    log("⏳ Waiting for Remote Desktop public tunnel URL...")
+                    vnc_url = await wait_for_vnc_url(timeout=40.0)
+                    vnc_url_sent = False
+
+                    if vnc_url:
+                        log(f"🖥️ Remote Desktop URL ready: {vnc_url}")
+                        vnc_url_sent = True
+                        vnc_section = f"🔗 Remote Desktop Link:\n{vnc_url}"
+                    else:
+                        log("⚠️ Quick Tunnel URL not available yet — starting standby...")
+                        vnc_section = "⚠️ Connecting tunnel... URL will arrive in the next message."
+
                     alert = (
                         f"🖥️ Manual Mode Active!\n\n"
-                        f"🔗 Remote Desktop: {vnc_url}\n\n"
+                        f"{vnc_section}\n\n"
                         f"Open the link on your phone or laptop browser.\n"
                         f"1️⃣ Log in to the student portal\n"
                         f"2️⃣ Find your class and click Join\n"
@@ -2652,7 +2687,11 @@ async def main() -> int:
                     await notify(alert)
 
                     # Passively wait for user to join a Zoom meeting (no clicks)
-                    zoom_page = await manual_wait_for_meeting(context, timeout=MANUAL_JOIN_WAIT_SEC)
+                    zoom_page = await manual_wait_for_meeting(
+                        context,
+                        timeout=MANUAL_JOIN_WAIT_SEC,
+                        vnc_already_sent=vnc_url_sent
+                    )
                     zoom_active.set()
 
                     await notify_photo(zoom_page, "📸 You're in the meeting — recording starts now")
