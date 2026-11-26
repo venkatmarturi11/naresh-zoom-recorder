@@ -174,14 +174,38 @@ ZOOM_COOKIES_FILE = _env("ZOOM_COOKIES_FILE")
 CF_TUNNEL_TOKEN = _env("CF_TUNNEL_TOKEN")
 VNC_PASSWORD = _env("VNC_PASSWORD")
 VNC_PUBLIC_URL = _env("VNC_PUBLIC_URL")
-if not VNC_PUBLIC_URL:
+MANUAL_JOIN_WAIT_SEC = _int_env("MANUAL_JOIN_WAIT_SEC", 600)
+
+
+def _get_vnc_url() -> str:
+    """Return the best available public VNC URL, re-reading the tunnel file if needed."""
+    global VNC_PUBLIC_URL
+    if VNC_PUBLIC_URL:
+        return VNC_PUBLIC_URL
+    # Quick Tunnel writes the URL to /out/vnc_url.txt after startup
     try:
         vnc_txt = Path("/out/vnc_url.txt")
         if vnc_txt.exists() and vnc_txt.stat().st_size > 0:
-            VNC_PUBLIC_URL = vnc_txt.read_text(encoding="utf-8").strip()
+            url = vnc_txt.read_text(encoding="utf-8").strip()
+            if url and "trycloudflare.com" in url:
+                VNC_PUBLIC_URL = url
+                return url
     except Exception:
         pass
-MANUAL_JOIN_WAIT_SEC = _int_env("MANUAL_JOIN_WAIT_SEC", 600)
+    # Last-resort: scan cloudflared log directly
+    try:
+        log_path = Path("/tmp/cloudflared.log")
+        if log_path.exists():
+            import re as _re
+            m = _re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', log_path.read_text())
+            if m:
+                url = m.group(0) + "/vnc.html?autoconnect=true&resize=scale"
+                VNC_PUBLIC_URL = url
+                Path("/out/vnc_url.txt").write_text(url, encoding="utf-8")
+                return url
+    except Exception:
+        pass
+    return ""  # No public URL available yet
 
 
 def parse_session_tokens(raw_text: str) -> list:
@@ -329,7 +353,8 @@ class StepTracker:
         if not self.path:
             return
         time_disp = (CLASS_START or 'Immediate') + " IST"
-        vnc_line = f"- **🖥️ Remote Desktop (noVNC):** [{VNC_PUBLIC_URL}]({VNC_PUBLIC_URL})\n" if VNC_PUBLIC_URL else ""
+        _vnc = _get_vnc_url()
+        vnc_line = f"- **🖥️ Remote Desktop (noVNC):** [{_vnc}]({_vnc})\n" if _vnc else ""
         header = (
             f"## 🎥 Zoom Class Recording Summary\n\n"
             f"- **Class Name:** `{ACTIVE_CLASS_TITLE}`\n"
@@ -2108,15 +2133,7 @@ async def wait_in_meeting(zp, max_wait: int = 0) -> None:
 
         if needs_human and not human_interaction_notified:
             human_interaction_notified = True
-            vnc_url = VNC_PUBLIC_URL
-            if not vnc_url:
-                try:
-                    vnc_f = Path("/out/vnc_url.txt")
-                    if vnc_f.exists():
-                        vnc_url = vnc_f.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-            vnc_url = vnc_url or "http://127.0.0.1:6080"
+            vnc_url = _get_vnc_url() or "(tunnel URL not yet available)"
             if is_bot_wall:
                 reason = "Bot verification challenge presented by Zoom"
             elif is_signin_wall:
@@ -2148,7 +2165,7 @@ async def wait_in_meeting(zp, max_wait: int = 0) -> None:
             last_diag = elapsed
             remaining = int(deadline - time.monotonic())
             snippet = re.sub(r"\s+", " ", text).strip()[:140]
-            vnc_info = f" | Remote Desktop: {VNC_PUBLIC_URL}" if VNC_PUBLIC_URL else ""
+            vnc_info = f" | Remote Desktop: {_get_vnc_url()}" if _get_vnc_url() else ""
             log(f"Waiting for meeting admission ({remaining}s remaining{vnc_info}): {snippet}")
 
         # Keep browser open and alive for human interaction through noVNC
@@ -2408,7 +2425,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26a (remote desktop vnc + manual interaction support)")
+        log("Recorder build 2026-11-26b (always-on quick tunnel + dynamic VNC URL)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
