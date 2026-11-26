@@ -175,6 +175,7 @@ CF_TUNNEL_TOKEN = _env("CF_TUNNEL_TOKEN")
 VNC_PASSWORD = _env("VNC_PASSWORD")
 VNC_PUBLIC_URL = _env("VNC_PUBLIC_URL")
 MANUAL_JOIN_WAIT_SEC = _int_env("MANUAL_JOIN_WAIT_SEC", 600)
+MANUAL_MODE = _env("MANUAL_MODE", "0").lower() in ("1", "true", "yes", "manual")
 
 
 def _get_vnc_url() -> str:
@@ -2237,6 +2238,96 @@ async def monitor(zp, started: float) -> str:
     failures = 0
     last_housekeeping = 0.0
     last_progress_log = time.monotonic()
+
+
+# --------------------------------------------------------------------------
+# Manual Mode: zero-automation browser session
+# --------------------------------------------------------------------------
+async def _find_zoom_page(context):
+    """Scan all tabs for a page on zoom.us (passive, no clicks)."""
+    for p in context.pages:
+        try:
+            url = p.url.lower()
+            if _is_zoom_host(url):
+                return p
+        except Exception:
+            pass
+    return None
+
+
+async def manual_wait_for_meeting(context, timeout: int):
+    """
+    Manual mode: passively poll browser tabs until the user has joined
+    a Zoom meeting. No automated clicks—just detection.
+    Returns the Zoom page once the user is admitted to the meeting.
+    """
+    deadline = time.monotonic() + timeout
+    last_log = 0.0
+    notified_zoom_found = False
+
+    while time.monotonic() < deadline:
+        # Scan all tabs for Zoom meeting page
+        for p in context.pages:
+            try:
+                url = p.url.lower()
+                if not _is_zoom_host(url):
+                    continue
+
+                if not notified_zoom_found:
+                    notified_zoom_found = True
+                    log("🎯 Detected Zoom page in browser — waiting for meeting admission...")
+                    step.record("Zoom Detected", "🔍", "Zoom page found — waiting for you to join the meeting")
+
+                # Check if actually admitted (passive DOM inspection, no clicks)
+                if await is_meeting_admitted(p):
+                    log("✅ Meeting admission confirmed!")
+                    step.record("Meeting Joined", "✅", "You are inside the Zoom meeting — starting recording")
+                    return p
+            except Exception:
+                continue
+
+        elapsed = time.monotonic() - (deadline - timeout)
+        if time.monotonic() - last_log >= 30:
+            last_log = time.monotonic()
+            remaining = int(deadline - time.monotonic())
+            vnc_url = _get_vnc_url()
+            tabs = len(context.pages)
+            log(f"⏳ Manual mode: waiting for meeting join ({remaining}s left, {tabs} tabs open)")
+
+        await asyncio.sleep(2)
+
+    raise RuntimeError(f"Manual mode timeout: no Zoom meeting joined within {timeout}s")
+
+
+async def manual_monitor(zp, started: float) -> str:
+    """Meeting monitor for manual mode — passive only, no dismiss_popups or CSS injection."""
+    failures = 0
+    last_progress_log = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= MAX_MEETING_SEC:
+            return "maximum duration reached"
+        if zp.is_closed():
+            return "Zoom tab closed"
+        url = zp.url
+        if "zoom." not in url or POST_MEETING_URL_RE.search(url):
+            return "redirected away from the meeting"
+        try:
+            text = await page_text(zp)
+            failures = 0
+            if END_RE.search(text):
+                return "meeting ended by host"
+        except Exception:
+            failures += 1
+            if failures > 20:
+                return "page became unreachable"
+
+        if time.monotonic() - last_progress_log >= 300:
+            last_progress_log = time.monotonic()
+            mins_elapsed = int(elapsed / 60)
+            step.record("Recording Active", "⏺️", f"Recording in progress: {mins_elapsed} mins elapsed")
+
+        await asyncio.sleep(3)
     while True:
         elapsed = time.monotonic() - started
         if elapsed >= MAX_MEETING_SEC:
@@ -2425,7 +2516,9 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26b (always-on quick tunnel + dynamic VNC URL)")
+        log("Recorder build 2026-11-26c (manual mode + always-on quick tunnel)")
+        if MANUAL_MODE:
+            log("🖥️ MANUAL MODE enabled — you control the browser, recorder only captures screen")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
@@ -2530,33 +2623,79 @@ async def main() -> int:
 
             page = context.pages[0] if context.pages else await context.new_page()
             try:
-                await login(page)
-                await open_todays_classes(page, first_time=True)
-                zoom_page = await wait_and_join(context, page)
+                if MANUAL_MODE:
+                    # ===== MANUAL MODE: zero automation, user drives everything =====
+                    vnc_url = _get_vnc_url()
+                    step.record("Manual Mode", "🖥️", "Manual navigation mode — no automated clicks")
+                    log("🖥️ MANUAL MODE: No automated portal login or Zoom joining")
+                    log("🖥️ You control the browser entirely through Remote Desktop")
 
-                if zoom_page is None:
-                    step.record("Run Result", "✅", "Pre-flight verification completed successfully. No recording required.")
-                    return 0
+                    # Just open the portal page — don't auto-login
+                    if PORTAL_URL:
+                        log(f"🌐 Opening portal for manual navigation: {mask_url(PORTAL_URL)}")
+                        try:
+                            await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30000)
+                        except Exception:
+                            pass
+                        step.record("Portal Opened", "🌐", "Portal loaded — log in and join class manually")
 
-                zoom_active.set()
-                await zoom_page.bring_to_front()
+                    alert = (
+                        f"🖥️ Manual Mode Active!\n\n"
+                        f"🔗 Remote Desktop: {vnc_url}\n\n"
+                        f"Open the link on your phone or laptop browser.\n"
+                        f"1️⃣ Log in to the student portal\n"
+                        f"2️⃣ Find your class and click Join\n"
+                        f"3️⃣ Join the Zoom meeting normally\n\n"
+                        f"📹 Recording starts automatically once you're inside the meeting.\n"
+                        f"⏱ Timeout: {MANUAL_JOIN_WAIT_SEC // 60} minutes"
+                    )
+                    await notify(alert)
 
-                zoom_page = await to_web_client(context, zoom_page)
-                await zoom_prejoin(zoom_page)
-                await wait_in_meeting(zoom_page, max_wait=MANUAL_JOIN_WAIT_SEC)
-                await join_audio(zoom_page)
-                dismiss_browser_prompt()
-                await notify_photo(zoom_page, "📸 Joined the meeting - recording starts now")
+                    # Passively wait for user to join a Zoom meeting (no clicks)
+                    zoom_page = await manual_wait_for_meeting(context, timeout=MANUAL_JOIN_WAIT_SEC)
+                    zoom_active.set()
 
-                recorder.start()
-                started = time.monotonic()
-                step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{ACTIVE_CLASS_TITLE}'")
-                await notify("✅ Joined class & started 1080p recording")
+                    await notify_photo(zoom_page, "📸 You're in the meeting — recording starts now")
 
-                await go_fullscreen(zoom_page)
-                end_reason = await monitor(zoom_page, started)
-                step.record("Meeting Concluded", "🏁", f"Meeting finished: {end_reason}")
-                log(f"Recording ends: {end_reason}")
+                    recorder.start()
+                    started = time.monotonic()
+                    step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{ACTIVE_CLASS_TITLE}'")
+                    await notify("✅ Meeting detected & recording started (manual mode)")
+
+                    # Passive monitor — no dismiss_popups or CSS injection
+                    end_reason = await manual_monitor(zoom_page, started)
+                    step.record("Meeting Concluded", "🏁", f"Meeting finished: {end_reason}")
+                    log(f"Recording ends: {end_reason}")
+
+                else:
+                    # ===== AUTOMATED MODE: existing bot-driven flow =====
+                    await login(page)
+                    await open_todays_classes(page, first_time=True)
+                    zoom_page = await wait_and_join(context, page)
+
+                    if zoom_page is None:
+                        step.record("Run Result", "✅", "Pre-flight verification completed successfully. No recording required.")
+                        return 0
+
+                    zoom_active.set()
+                    await zoom_page.bring_to_front()
+
+                    zoom_page = await to_web_client(context, zoom_page)
+                    await zoom_prejoin(zoom_page)
+                    await wait_in_meeting(zoom_page, max_wait=MANUAL_JOIN_WAIT_SEC)
+                    await join_audio(zoom_page)
+                    dismiss_browser_prompt()
+                    await notify_photo(zoom_page, "📸 Joined the meeting - recording starts now")
+
+                    recorder.start()
+                    started = time.monotonic()
+                    step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{ACTIVE_CLASS_TITLE}'")
+                    await notify("✅ Joined class & started 1080p recording")
+
+                    await go_fullscreen(zoom_page)
+                    end_reason = await monitor(zoom_page, started)
+                    step.record("Meeting Concluded", "🏁", f"Meeting finished: {end_reason}")
+                    log(f"Recording ends: {end_reason}")
             except asyncio.CancelledError:
                 error = "run was cancelled"
                 raise

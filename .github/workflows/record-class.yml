@@ -26,6 +26,14 @@ on:
         description: "Seconds to wait for manual human interaction if Zoom requires it (default: 600)"
         required: false
         default: "600"
+      manual_mode:
+        description: "Manual mode: YOU navigate the portal & join Zoom via Remote Desktop. No bot automation. (true/false)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: read
@@ -75,6 +83,7 @@ jobs:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           VNC_PUBLIC_URL: ${{ vars.VNC_PUBLIC_URL }}
           MANUAL_JOIN_WAIT_SEC: ${{ inputs.manual_join_wait_sec || vars.MANUAL_JOIN_WAIT_SEC || '600' }}
+          MANUAL_MODE: ${{ inputs.manual_mode || vars.MANUAL_MODE || 'false' }}
         run: |
           mkdir -p out && chmod 777 out
           touch out/step_summary.md && chmod 666 out/step_summary.md
@@ -104,7 +113,7 @@ jobs:
             -e USER_SELECTOR -e PASS_SELECTOR -e PARTICIPANT_NAME -e ZOOM_EMAIL -e ZOOM_PASS \
             -e ZOOM_COOKIES \
             -e MAX_WAIT_MIN -e MAX_MEETING_SEC -e ALLOWED_HOSTS -e BLOCK_TRACKERS \
-            -e CF_TUNNEL_TOKEN -e VNC_PASSWORD -e VNC_PUBLIC_URL -e MANUAL_JOIN_WAIT_SEC \
+            -e CF_TUNNEL_TOKEN -e VNC_PASSWORD -e VNC_PUBLIC_URL -e MANUAL_JOIN_WAIT_SEC -e MANUAL_MODE \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/naresh-zoom-recorder:latest"
 
       - name: Publish Step Summary to GitHub Job
