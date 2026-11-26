@@ -2373,6 +2373,37 @@ async def monitor(zp, started: float) -> str:
     failures = 0
     last_housekeeping = 0.0
     last_progress_log = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= MAX_MEETING_SEC:
+            return "maximum duration reached"
+        if zp.is_closed():
+            return "Zoom tab closed"
+        url = zp.url
+        if "zoom." not in url or POST_MEETING_URL_RE.search(url):
+            return "redirected away from the meeting"
+        if SIGNIN_URL_RE.search(url):
+            return "kicked to the Zoom sign-in page"
+        try:
+            text = await page_text(zp)
+            failures = 0
+            if END_RE.search(text):
+                return "meeting ended by host"
+        except Exception:
+            failures += 1
+            if failures > 20:
+                return "page became unreachable"
+
+        if time.monotonic() - last_progress_log >= 300:
+            last_progress_log = time.monotonic()
+            mins_elapsed = int(elapsed / 60)
+            step.record("Recording Active", "⏺️", f"Recording in progress: {mins_elapsed} mins elapsed | Host streaming")
+
+        if time.monotonic() - last_housekeeping > 10:
+            last_housekeeping = time.monotonic()
+            await dismiss_popups(zp)
+            await inject_hide_css(zp)
+        await asyncio.sleep(3)
 
 
 # --------------------------------------------------------------------------
@@ -2471,37 +2502,6 @@ async def manual_monitor(zp, started: float) -> str:
             mins_elapsed = int(elapsed / 60)
             step.record("Recording Active", "⏺️", f"Recording in progress: {mins_elapsed} mins elapsed")
 
-        await asyncio.sleep(3)
-    while True:
-        elapsed = time.monotonic() - started
-        if elapsed >= MAX_MEETING_SEC:
-            return "maximum duration reached"
-        if zp.is_closed():
-            return "Zoom tab closed"
-        url = zp.url
-        if "zoom." not in url or POST_MEETING_URL_RE.search(url):
-            return "redirected away from the meeting"
-        if SIGNIN_URL_RE.search(url):
-            return "kicked to the Zoom sign-in page"
-        try:
-            text = await page_text(zp)
-            failures = 0
-            if END_RE.search(text):
-                return "meeting ended by host"
-        except Exception:
-            failures += 1
-            if failures > 20:
-                return "page became unreachable"
-
-        if time.monotonic() - last_progress_log >= 300:
-            last_progress_log = time.monotonic()
-            mins_elapsed = int(elapsed / 60)
-            step.record("Recording Active", "⏺️", f"Recording in progress: {mins_elapsed} mins elapsed | Host streaming")
-
-        if time.monotonic() - last_housekeeping > 10:
-            last_housekeeping = time.monotonic()
-            await dismiss_popups(zp)
-            await inject_hide_css(zp)
         await asyncio.sleep(3)
 
 
@@ -2660,7 +2660,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26g (restored robust portal login + Zoom HumanCursor)")
+        log("Recorder build 2026-11-26h (restored monitor loop — full duration recording)")
         if MANUAL_MODE:
             log("🖥️ MANUAL MODE enabled — you control the browser, recorder only captures screen")
 
