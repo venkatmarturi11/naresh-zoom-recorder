@@ -2539,7 +2539,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26d (reliable quick tunnel delivery + manual mode)")
+        log("Recorder build 2026-11-26e (clean quick tunnel flags + robust url delivery)")
         if MANUAL_MODE:
             log("🖥️ MANUAL MODE enabled — you control the browser, recorder only captures screen")
 
