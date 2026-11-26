@@ -13,6 +13,7 @@ import asyncio
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -221,6 +222,157 @@ async def wait_for_vnc_url(timeout: float = 40.0) -> str:
             return url
         await asyncio.sleep(1)
     return _get_vnc_url()
+
+
+# --------------------------------------------------------------------------
+# Human Behavior & Cursor Physics Engine
+# Evades Zoom bot detection by generating natural Bézier curve mouse trajectories,
+# hand jitter tremors, realistic dwell times, human keystroke cadences, and
+# browser-level CDP pointer events where event.isTrusted === true.
+# --------------------------------------------------------------------------
+class HumanCursor:
+    """Simulates realistic human mouse dynamics using cubic Bézier curves,
+    natural acceleration/deceleration physics, hand tremor jitter, randomized
+    dwell times, and browser-level CDP dispatch events (isTrusted === true)."""
+
+    def __init__(self):
+        self.x = float(random.randint(250, 750))
+        self.y = float(random.randint(180, 500))
+
+    @staticmethod
+    def _bezier_point(p0: float, p1: float, p2: float, p3: float, t: float) -> float:
+        return (
+            (1.0 - t) ** 3 * p0
+            + 3.0 * (1.0 - t) ** 2 * t * p1
+            + 3.0 * (1.0 - t) * t ** 2 * p2
+            + t ** 3 * p3
+        )
+
+    async def move_to(self, page, target_x: float, target_y: float) -> None:
+        """Smoothly moves cursor to (target_x, target_y) along a curved human trajectory."""
+        start_x, start_y = self.x, self.y
+        dist = math.hypot(target_x - start_x, target_y - start_y)
+        if dist < 6:
+            self.x, self.y = target_x, target_y
+            try:
+                await page.mouse.move(target_x, target_y)
+            except Exception:
+                pass
+            return
+
+        mid_x = (start_x + target_x) / 2.0
+        mid_y = (start_y + target_y) / 2.0
+        arc = random.uniform(-0.25, 0.25) * dist
+
+        ctrl1_x = start_x + (mid_x - start_x) * 0.7 + arc * random.uniform(0.4, 0.9)
+        ctrl1_y = start_y + (mid_y - start_y) * 0.7 - arc * random.uniform(0.4, 0.9)
+        ctrl2_x = mid_x + (target_x - mid_x) * 0.8 - arc * random.uniform(0.3, 0.7)
+        ctrl2_y = mid_y + (target_y - mid_y) * 0.8 + arc * random.uniform(0.3, 0.7)
+
+        steps = max(10, min(35, int(dist / random.uniform(16.0, 26.0))))
+
+        for i in range(1, steps + 1):
+            t = i / float(steps)
+            t_eased = (1.0 - math.cos(t * math.pi)) / 2.0
+
+            bx = self._bezier_point(start_x, ctrl1_x, ctrl2_x, target_x, t_eased)
+            by = self._bezier_point(start_y, ctrl1_y, ctrl2_y, target_y, t_eased)
+
+            if i < steps - 2:
+                bx += random.uniform(-1.0, 1.0)
+                by += random.uniform(-1.0, 1.0)
+
+            try:
+                await page.mouse.move(bx, by)
+            except Exception:
+                pass
+            self.x, self.y = bx, by
+            await asyncio.sleep(random.uniform(0.007, 0.019))
+
+        self.x, self.y = target_x, target_y
+        try:
+            await page.mouse.move(target_x, target_y)
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.03, 0.08))
+
+    async def click(self, page, locator) -> bool:
+        """Hover naturally, dwell, press down (isTrusted: true), hold, and release."""
+        try:
+            box = await locator.bounding_box()
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                await locator.click(timeout=2000)
+                return True
+
+            tgt_x = box["x"] + box["width"] * random.uniform(0.28, 0.72)
+            tgt_y = box["y"] + box["height"] * random.uniform(0.32, 0.68)
+
+            await self.move_to(page, tgt_x, tgt_y)
+            await asyncio.sleep(random.uniform(0.10, 0.25))
+
+            await page.mouse.down()
+            await asyncio.sleep(random.uniform(0.055, 0.120))
+            await page.mouse.up()
+
+            await asyncio.sleep(random.uniform(0.12, 0.28))
+            return True
+        except Exception:
+            try:
+                await locator.click(timeout=1500)
+                return True
+            except Exception:
+                return False
+
+    async def type_text(self, page, locator, text: str) -> bool:
+        """Clicks input field and types with variable human keystroke rhythm."""
+        try:
+            if not await self.click(page, locator):
+                await locator.click(timeout=2000)
+
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+
+            try:
+                curr_val = await locator.input_value()
+                if curr_val:
+                    await page.keyboard.press("Control+A")
+                    await asyncio.sleep(random.uniform(0.06, 0.12))
+                    await page.keyboard.press("Backspace")
+                    await asyncio.sleep(random.uniform(0.08, 0.18))
+            except Exception:
+                pass
+
+            for ch in text:
+                await page.keyboard.press(ch)
+                if ch in (" ", ".", "-", "@", "_"):
+                    delay = random.uniform(0.120, 0.240)
+                elif ch.isupper() or ch.isdigit():
+                    delay = random.uniform(0.075, 0.160)
+                else:
+                    delay = random.uniform(0.040, 0.105)
+                await asyncio.sleep(delay)
+
+            await asyncio.sleep(random.uniform(0.15, 0.30))
+            return True
+        except Exception:
+            try:
+                await locator.fill(text)
+                return True
+            except Exception:
+                return False
+
+    async def ambient_wander(self, page) -> None:
+        """Simulate random subtle human cursor drift while page is loading."""
+        try:
+            dx = random.uniform(-80, 80)
+            dy = random.uniform(-50, 50)
+            tx = max(100.0, min(1800.0, self.x + dx))
+            ty = max(100.0, min(950.0, self.y + dy))
+            await self.move_to(page, tx, ty)
+        except Exception:
+            pass
+
+
+human_cursor = HumanCursor()
 
 
 def parse_session_tokens(raw_text: str) -> list:
@@ -807,15 +959,16 @@ class FFmpegRecorder:
 # Generic page helpers
 # --------------------------------------------------------------------------
 async def click_any(page, patterns, role="button", timeout=800):
-    """Click the first visible element of `role` whose name matches a pattern.
-    Searches the main page and every frame. Returns the matched pattern."""
+    """Click the first visible element of `role` whose name matches a pattern
+    using natural human cursor movement and click physics."""
     for frame in page.frames:
         for pat in patterns:
             try:
                 loc = frame.get_by_role(role, name=re.compile(pat, re.I)).first
                 if await loc.count() and await loc.is_visible():
-                    await loc.click(timeout=timeout)
-                    return pat
+                    await loc.scroll_into_view_if_needed()
+                    if await human_cursor.click(page, loc):
+                        return pat
             except Exception:
                 continue
     return None
@@ -912,13 +1065,17 @@ async def login(page) -> None:
 
     step.record("Portal Login", "🔑", f"Entering credentials for user: {PORTAL_USER[:3]}***")
     user_field = page.locator(USER_SEL).first
-    await user_field.fill(PORTAL_USER)
-    await pw_field.fill(PORTAL_PASS)
+    await human_cursor.type_text(page, user_field, PORTAL_USER)
+    await human_cursor.type_text(page, pw_field, PORTAL_PASS)
 
     submitted = await click_any(page, [r"^log ?in$", r"sign ?in", r"^submit$", r"^login"])
     if not submitted:
         try:
-            await page.locator('button[type="submit"], input[type="submit"]').first.click(timeout=1500)
+            sub = page.locator('button[type="submit"], input[type="submit"]').first
+            if await sub.count() and await sub.is_visible():
+                await human_cursor.click(page, sub)
+            else:
+                await pw_field.press("Enter")
         except Exception:
             await pw_field.press("Enter")
 
@@ -1486,67 +1643,41 @@ async def click_join(context, page, btn, wait_sec: int = 25):
 # State 4: Zoom web client, strictly no mic / no video
 # --------------------------------------------------------------------------
 async def click_browser_join(zp) -> bool:
-    """Click 'Join from browser' on Zoom's Vue.js launch page.
-    Playwright's synthesized click often does NOT fire Vue's event handler,
-    so we use a full PointerEvent + MouseEvent dispatch sequence, then fall
-    back to extracting the webClientUrl from the page and navigating."""
+    """Click 'Join from browser' on Zoom's launch page using real human cursor physics.
+    Dispatches genuine CDP pointer events with isTrusted === true to bypass bot detection."""
     pat = re.compile(r"join from (your )?browser", re.I)
     url_before = zp.url
 
-    # Strategy 1: JavaScript-level full event dispatch (fires Vue handlers)
-    try:
-        navigated = await zp.evaluate("""() => {
-            const pat = /join from.*browser/i;
-            const els = [...document.querySelectorAll('button, a, [role="button"]')]
-                .filter(e => pat.test(e.textContent || '') && e.offsetParent !== null);
-            if (!els.length) return false;
-            const b = els[0];
-            b.scrollIntoView();
-            for (const E of [PointerEvent, MouseEvent]) {
-                for (const t of ['pointerdown','pointerup','mousedown','mouseup','click']) {
-                    try { b.dispatchEvent(new E(t, {bubbles:true, cancelable:true, view:window})); } catch(e) {}
-                }
-            }
-            b.click();
-            return true;
-        }""")
-        if navigated:
-            log("Dispatched full pointer+click events on 'Join from browser' button")
-            await asyncio.sleep(2.5)
-            if zp.url != url_before or "/wc/" in zp.url:
-                return True
-    except Exception:
-        pass
-
-    # Strategy 2: Playwright role-based click (link first, then button)
+    # Strategy 1: Natural human Bézier move and click on the 'Join from browser' element
     for frame in zp.frames:
         for r in ("link", "button"):
             try:
                 loc = frame.get_by_role(r, name=pat).first
                 if await asyncio.wait_for(loc.count(), 2) > 0 and await asyncio.wait_for(loc.is_visible(), 2):
-                    href = None
-                    try:
-                        tag = await loc.evaluate("el => el.tagName.toLowerCase()")
-                        if tag == "a":
-                            href = await loc.get_attribute("href", timeout=2000)
-                            if href and href.startswith("/"):
-                                href = urllib.parse.urljoin(zp.url, href)
-                    except Exception:
-                        pass
-                    await loc.click(force=True, timeout=2500)
-                    await asyncio.sleep(1.5)
-                    if zp.url != url_before or "/wc/" in zp.url:
-                        return True
-                    if href and href.startswith("http") and _is_zoom_host(href):
-                        log(f"Click didn't navigate; following href: {mask_url(href)}")
-                        try:
-                            await zp.goto(href, wait_until="commit", timeout=15000)
-                            if zp.url != url_before or "/wc/" in zp.url:
-                                return True
-                        except Exception:
-                            pass
+                    await loc.scroll_into_view_if_needed()
+                    if await human_cursor.click(zp, loc):
+                        log(f"Human-clicked 'Join from browser' ({r})")
+                        await asyncio.sleep(2.0)
+                        if zp.url != url_before or "/wc/" in zp.url:
+                            return True
             except Exception:
-                pass
+                continue
+
+    # Strategy 2: Selector-based human click
+    for frame in zp.frames:
+        try:
+            links = frame.locator("a, button, [role='button']").filter(has_text=pat)
+            if await links.count() > 0:
+                l0 = links.first
+                if await l0.is_visible():
+                    await l0.scroll_into_view_if_needed()
+                    if await human_cursor.click(zp, l0):
+                        log("Human-clicked 'Join from browser' (selector)")
+                        await asyncio.sleep(2.0)
+                        if zp.url != url_before or "/wc/" in zp.url:
+                            return True
+        except Exception:
+            pass
 
     # Strategy 3: Extract webClientUrl from the page's JS/protobuf data
     try:
@@ -1888,15 +2019,9 @@ async def click_prejoin_join(zp) -> bool:
                 btn = frame.locator(sel).first
                 if await btn.count() and await btn.is_visible():
                     await btn.scroll_into_view_if_needed()
-                    try:
-                        await btn.click(force=True, timeout=1500)
-                    except Exception:
-                        try:
-                            await btn.evaluate("b => { b.click(); if (b.form) b.form.submit(); }")
-                        except Exception:
-                            pass
-                    log(f"Clicked pre-join button ({sel})")
-                    return True
+                    if await human_cursor.click(zp, btn):
+                        log(f"Human-clicked pre-join button ({sel})")
+                        return True
             except Exception:
                 continue
 
@@ -1910,15 +2035,9 @@ async def click_prejoin_join(zp) -> bool:
                     box = await b.bounding_box()
                     if box and box["y"] > 250:
                         await b.scroll_into_view_if_needed()
-                        try:
-                            await b.click(force=True, timeout=1500)
-                        except Exception:
-                            try:
-                                await b.evaluate("b => b.click()")
-                            except Exception:
-                                pass
-                        log(f"Clicked pre-join button at y={box['y']:.0f}")
-                        return True
+                        if await human_cursor.click(zp, b):
+                            log(f"Human-clicked pre-join button at y={box['y']:.0f}")
+                            return True
         except Exception:
             continue
     return False
@@ -1952,8 +2071,8 @@ async def zoom_prejoin(zp) -> None:
                 if await name_in.count() and await name_in.is_visible():
                     val = await name_in.input_value()
                     if not val.strip() or val.strip().lower() in ("guest", "zoom", "user"):
-                        await name_in.fill(PARTICIPANT_NAME)
-                        step.record("Participant Name", "👤", f"Set student display name: {PARTICIPANT_NAME}")
+                        await human_cursor.type_text(zp, name_in, PARTICIPANT_NAME)
+                        step.record("Participant Name", "👤", f"Human-typed student display name: {PARTICIPANT_NAME}")
                         await asyncio.sleep(1)
                         break
             except Exception:
@@ -2183,6 +2302,10 @@ async def wait_in_meeting(zp, max_wait: int = 0) -> None:
             vnc_info = f" | Remote Desktop: {_get_vnc_url()}" if _get_vnc_url() else ""
             log(f"Waiting for meeting admission ({remaining}s remaining{vnc_info}): {snippet}")
 
+        # Natural ambient human cursor movement while waiting
+        if random.random() < 0.40:
+            await human_cursor.ambient_wander(zp)
+
         # Keep browser open and alive for human interaction through noVNC
         await asyncio.sleep(2)
 
@@ -2212,8 +2335,9 @@ async def join_audio(zp) -> None:
                     "button[aria-label*='Join Audio' i]"
                 ).first
                 if await btn.count() and await btn.is_visible():
-                    await btn.click(timeout=1500)
-                    break
+                    await btn.scroll_into_view_if_needed()
+                    if await human_cursor.click(zp, btn):
+                        break
             except Exception:
                 pass
         if await click_any(zp, patterns):
@@ -2539,7 +2663,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-26e (clean quick tunnel flags + robust url delivery)")
+        log("Recorder build 2026-11-26f (HumanCursor Bézier physics + natural event dispatch)")
         if MANUAL_MODE:
             log("🖥️ MANUAL MODE enabled — you control the browser, recorder only captures screen")
 
