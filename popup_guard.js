@@ -38,7 +38,16 @@
     "#onetrust-consent-sdk,#onetrust-banner-sdk,#onetrust-pc-sdk,.onetrust-pc-dark-filter," +
     "#CybotCookiebotDialog,#cookie-law-info-bar,.cc-window{display:none!important;visibility:hidden!important}" +
     (isZoom
-      ? "[class*='toast' i],[class*='snackbar' i],[role='tooltip']{display:none!important}"
+      ? "\n[class*='toast' i],[class*='snackbar' i],[role='tooltip']," +
+      "[class*='notes-guide' i],[class*='coachmark' i],[class*='popover' i],[class*='popover-content' i]," +
+      "[class*='tip-bubble' i],[class*='guide-bubble' i],[id*='notes-guide' i]," +
+      "[class*='hardware-acceleration' i],[class*='system-warning' i],.warning-bar,[class*='warning-bar' i]," +
+      "[class*='system-notice' i],[class*='announcement' i],[class*='announcement-bar' i]," +
+      ".speaker-bar,.speaker-bar-container,.filmstrip-box,.filmstrip,.sharing-layout__speaker-bar," +
+      ".speaker-active-container,.video-avatar-box,.video-box__video-list," +
+      "[class*='filmstrip' i],[class*='speaker-bar' i],[class*='speaker-video' i],[class*='gallery-video' i]," +
+      "[class*='video-avatar-list' i],[class*='video-bar' i]" +
+      "{display:none!important;visibility:hidden!important;opacity:0!important}"
       : "");
 
   function ensureCss() {
@@ -59,6 +68,8 @@
     "#onetrust-banner-sdk", "#onetrust-pc-sdk", '[id*="cookie" i]',
     '[class*="cookie-banner" i]', '[class*="cookie-consent" i]', '[class*="toast" i]',
     '[class*="snackbar" i]', '[class*="notification" i]',
+    '[class*="coachmark" i]', '[class*="popover" i]', '[class*="tip-bubble" i]',
+    '[class*="guide" i]', '[class*="banner" i]', '[class*="bubble" i]',
   ].join(",");
 
   const BUTTONS = 'button,[role="button"],a,input[type="button"],input[type="submit"]';
@@ -121,7 +132,7 @@
       for (const b of btns) {
         const l = label(b);
         const cl = cls(b);
-        if (CLOSE.test(l) || /close|dismiss|btn-close/i.test(cl)) {
+        if (CLOSE.test(l) || /close|dismiss|btn-close|banner-close/i.test(cl)) {
           b.click();
           return true;
         }

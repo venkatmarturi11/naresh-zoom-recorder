@@ -1,3 +1,5 @@
 playwright==1.48.0
 pyrogram==2.0.106
 python-dotenv==1.0.1
+TgCrypto-pyrofork>=1.2.8
+

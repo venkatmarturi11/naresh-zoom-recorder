@@ -459,10 +459,32 @@ async def setup_zoom_session(context) -> int:
     return loaded
 
 HIDE_CSS = """
-#wc-footer, #foot-bar, .footer-bar, .footer__inner, .meeting-info-container,
-.zm-notification, [class*='toast'], [class*='Toast'], [class*='notification'],
-[class*='join-leave'], [class*='tooltip'], [role='alert'], [role='tooltip'] {
-  display: none !important; visibility: hidden !important; opacity: 0 !important;
+/* Top filmstrip / participant video tiles (matches Image 1: shared screen fills full width/height) */
+.speaker-bar, .speaker-bar-container, .filmstrip-box, .filmstrip,
+.sharing-layout__speaker-bar, .speaker-active-container, .video-avatar-box,
+.video-box__video-list, [class*='filmstrip'], [class*='speaker-bar'],
+[class*='speaker-video'], [class*='gallery-video'], [class*='video-avatar-list'],
+[class*='video-bar'] {
+  display: none !important;
+  height: 0 !important;
+  max-height: 0 !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Notes coachmark, hardware acceleration banner, popovers, tooltips & notifications */
+[class*='notes-guide'], [class*='coachmark'], [class*='popover'],
+[class*='popover-content'], [class*='tip-bubble'], [class*='guide-bubble'],
+[id*='notes-guide'], [class*='hardware-acceleration'], [class*='system-warning'],
+.warning-bar, [class*='warning-bar'], [class*='system-notice'],
+[class*='announcement'], [class*='announcement-bar'], .zm-notification,
+[class*='toast'], [class*='Toast'], [class*='notification'],
+[class*='join-leave'], [class*='tooltip'], [role='tooltip'] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 """
 
@@ -877,25 +899,28 @@ class FFmpegRecorder:
 
     @staticmethod
     def _graceful_stop(p: subprocess.Popen) -> None:
-        """Send 'q' so FFmpeg finalises the container, then escalate."""
+        """Send SIGINT or 'q' so FFmpeg finalises the container cleanly and immediately."""
         if not p or p.poll() is not None:
             return
         try:
-            p.stdin.write(b"q")
-            p.stdin.flush()
-            p.stdin.close()
+            p.send_signal(signal.SIGINT)
+            p.wait(timeout=10)
+            return
         except Exception:
             pass
         try:
-            p.wait(timeout=180)
+            if p.stdin and not p.stdin.closed:
+                p.stdin.write(b"q\n")
+                p.stdin.flush()
+            p.wait(timeout=5)
             return
-        except subprocess.TimeoutExpired:
+        except Exception:
             pass
-        p.send_signal(signal.SIGINT)
         try:
-            p.wait(timeout=60)
-        except subprocess.TimeoutExpired:
             p.kill()
+            p.wait(timeout=5)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -968,9 +993,11 @@ async def page_text(page) -> str:
 
 async def inject_hide_css(page) -> None:
     js = (
-        "(css)=>{if(!document.getElementById('__rec_hide')){"
-        "const s=document.createElement('style');s.id='__rec_hide';"
-        "s.textContent=css;(document.head||document.documentElement).appendChild(s);}}"
+        "(css)=>{"
+        "let s=document.getElementById('__rec_hide');"
+        "if(!s){s=document.createElement('style');s.id='__rec_hide';(document.head||document.documentElement).appendChild(s);}"
+        "if(s.textContent!==css){s.textContent=css;}"
+        "}"
     )
     for frame in page.frames:
         try:
@@ -2126,17 +2153,33 @@ async def dismiss_popups(zp) -> None:
     await click_any(zp, POPUP_PATTERNS)
     for frame in zp.frames:
         try:
+            # Dismiss "Introducing My Notes" or similar coachmarks / guide bubbles
+            got_it = frame.locator(
+                "button:has-text('Got it'), [role='button']:has-text('Got it'), "
+                ".zm-btn:has-text('Got it'), a:has-text('Got it'), "
+                "button:has-text('Dismiss'), button:has-text('OK')"
+            ).first
+            if await got_it.count() and await got_it.is_visible():
+                await got_it.click(timeout=800)
+        except Exception:
+            pass
+        try:
+            # Dismiss dialogs, modals, and warning banners (e.g. hardware acceleration banner)
             close_btn = frame.locator(
                 "[role='dialog'] button[aria-label*='close' i], "
                 ".zm-modal button[aria-label*='close' i], "
-                "button[aria-label='Close' i]"
+                "[class*='banner'] button, [class*='warning'] button, "
+                "[class*='notice'] button, [class*='announcement'] button, "
+                "button[aria-label='Close' i], button[aria-label*='dismiss' i], "
+                "button.btn-close, button.close, .banner-close"
             ).first
             if await close_btn.count() and await close_btn.is_visible():
                 label = (await close_btn.get_attribute("aria-label") or "").lower()
-                if not re.search(r"leave|end|exit", label):
+                text = (await close_btn.inner_text() or "").lower()
+                if not re.search(r"leave|end|exit", label) and not re.search(r"leave|end|exit", text):
                     await close_btn.click(timeout=800)
         except Exception:
-            continue
+            pass
 
 
 async def is_meeting_admitted(zp) -> bool:
@@ -2345,24 +2388,67 @@ async def join_audio(zp) -> None:
 
 
 # --------------------------------------------------------------------------
-# State 5: clean full screen
+# State 5: clean presentation view (Image 1 layout)
 # --------------------------------------------------------------------------
-async def go_fullscreen(zp) -> None:
+async def set_clean_presentation_view(zp) -> None:
+    """
+    Configures Zoom Web Client to match the target clean presentation layout (Image 1):
+    - NO Zoom internal full screen mode (prevents black letterbox/pillarbox canvas).
+    - Exits full screen if active (presses Escape and clicks Exit Full Screen).
+    - Hides the top participant video filmstrip/gallery tiles so the slide fills width/height.
+    - Dismisses popups ('Introducing My Notes', hardware acceleration warning banner).
+    - Injects CSS to keep view permanently clean while preserving the bottom toolbar (#wc-footer).
+    """
+    # 1. Ensure NOT in Zoom internal full screen
     try:
-        already = await zp.evaluate(
-            "window.innerWidth >= screen.width - 2 && window.innerHeight >= screen.height - 2"
-        )
-        if not already:  # kiosk mode is normally fullscreen; F11 would toggle it OFF
-            await zp.keyboard.press("F11")
-            await asyncio.sleep(0.5)
+        is_fullscreen = False
+        try:
+            is_fullscreen = await zp.evaluate(
+                "Boolean(document.fullscreenElement || document.webkitFullscreenElement || "
+                "document.querySelector('.exit-fullscreen, [class*=\"fullscreen-exit\"], button[aria-label*=\"exit full\" i]'))"
+            )
+        except Exception:
+            pass
+
+        if is_fullscreen:
+            await zp.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+
+            for frame in zp.frames:
+                try:
+                    exit_fs = frame.locator(
+                        "button[aria-label*='exit full' i], button[title*='exit full' i], "
+                        "button:has-text('Exit Full Screen'), [class*='exit-fullscreen'], "
+                        "[class*='fullscreen-exit']"
+                    ).first
+                    if await exit_fs.count() and await exit_fs.is_visible():
+                        await exit_fs.click(timeout=800)
+                        await asyncio.sleep(0.3)
+                        break
+                except Exception:
+                    continue
     except Exception:
         pass
+
+    # 2. Try to hide video panel via Zoom UI if present
     try:
-        if await click_any(zp, [r"^view$"]):
-            if not await click_any(zp, [r"full screen"], role="menuitem"):
-                await zp.keyboard.press("Escape")
+        for frame in zp.frames:
+            try:
+                hvp = frame.locator(
+                    "button:has-text('Hide Video Panel'), [role='menuitem']:has-text('Hide Video Panel')"
+                ).first
+                if await hvp.count() and await hvp.is_visible():
+                    await hvp.click(timeout=800)
+                    break
+            except Exception:
+                continue
     except Exception:
         pass
+
+    # 3. Dismiss any visible popups (Notes "Got it", hardware acceleration "x", etc.)
+    await dismiss_popups(zp)
+
+    # 4. Inject CSS to hide top filmstrip, popovers, and banners permanently
     await inject_hide_css(zp)
 
 
@@ -2401,8 +2487,7 @@ async def monitor(zp, started: float) -> str:
 
         if time.monotonic() - last_housekeeping > 10:
             last_housekeeping = time.monotonic()
-            await dismiss_popups(zp)
-            await inject_hide_css(zp)
+            await set_clean_presentation_view(zp)
         await asyncio.sleep(3)
 
 
@@ -2601,33 +2686,67 @@ async def upload_to_telegram(path: str) -> None:
     from pyrogram import Client
     from pyrogram.errors import FloodWait
 
+    try:
+        import tgcrypto
+        log("⚡ Fast MTProto crypto engine (TgCrypto) loaded successfully")
+    except ImportError:
+        log("⚠️ TgCrypto not found; using pure-python crypto (slower)")
+
     size = os.path.getsize(path)
     parts = [path] if size <= TG_SIZE_LIMIT else await asyncio.to_thread(split_file, path)
-    total = len(parts)
+    total_parts = len(parts)
     base_caption = f"🎥 {ACTIVE_CLASS_TITLE} | {datetime.now(IST).strftime('%Y-%m-%d')}"
-    step.record("Telegram Upload", "📤", f"Uploading {total} part(s) ({size / 1024**3:.2f} GB total) to @Meeting_recorder_bot")
+    step.record("Telegram Upload", "📤", f"Uploading {total_parts} part(s) ({size / 1024**3:.2f} GB total) to @Meeting_recorder_bot")
 
     async with Client(
-        "recorder", api_id=int(TG_API_ID), api_hash=TG_API_HASH,
-        bot_token=TG_BOT_TOKEN, in_memory=True,
+        "recorder",
+        api_id=int(TG_API_ID),
+        api_hash=TG_API_HASH,
+        bot_token=TG_BOT_TOKEN,
+        in_memory=True,
+        workers=8,
+        max_concurrent_transmissions=4,
     ) as app:
         for idx, part in enumerate(parts, 1):
-            caption = base_caption + (f" (Part {idx}/{total})" if total > 1 else "")
+            part_size = os.path.getsize(part)
+            caption = base_caption + (f" (Part {idx}/{total_parts})" if total_parts > 1 else "")
             duration = int(await asyncio.to_thread(probe_duration, part))
             thumb = await asyncio.to_thread(make_thumb, part)
+
+            last_log_time = 0.0
+            def upload_progress(current, total):
+                nonlocal last_log_time
+                now = time.monotonic()
+                if now - last_log_time >= 5 or current == total:
+                    last_log_time = now
+                    pct = (current / total) * 100 if total else 0
+                    mb_cur = current / (1024 * 1024)
+                    mb_tot = total / (1024 * 1024)
+                    log(f"📤 Upload progress (Part {idx}/{total_parts}): {pct:.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB)")
+
             for attempt in range(1, 4):
                 try:
+                    log(f"📤 Starting Telegram upload for Part {idx}/{total_parts} ({part_size / (1024 * 1024):.1f} MB, attempt {attempt})...")
                     await app.send_video(
-                        chat_id=_chat_id(), video=part, caption=caption,
-                        supports_streaming=True, width=1920, height=1080,
-                        duration=duration, thumb=thumb,
+                        chat_id=_chat_id(),
+                        video=part,
+                        caption=caption,
+                        supports_streaming=True,
+                        width=1920,
+                        height=1080,
+                        duration=duration,
+                        thumb=thumb,
+                        progress=upload_progress,
                     )
-                    step.record("Telegram Upload", "✅", f"Part {idx}/{total} uploaded successfully")
+                    step.record("Telegram Upload", "✅", f"Part {idx}/{total_parts} uploaded successfully")
+                    log(f"✅ Part {idx}/{total_parts} uploaded successfully to Telegram!")
                     break
                 except FloodWait as fw:
-                    await asyncio.sleep(int(fw.value) + 1)
+                    wait_s = int(fw.value) + 1
+                    log(f"⚠️ Telegram FloodWait: waiting {wait_s}s...")
+                    await asyncio.sleep(wait_s)
                 except Exception as e:
-                    log(f"Upload attempt {attempt} failed ({type(e).__name__})")
+                    log(f"Upload attempt {attempt} failed ({type(e).__name__}: {e})")
                     if attempt == 3:
                         raise
                     await asyncio.sleep(5 * attempt)
@@ -2815,6 +2934,7 @@ async def main() -> int:
                     )
                     zoom_active.set()
 
+                    await set_clean_presentation_view(zoom_page)
                     await notify_photo(zoom_page, "📸 You're in the meeting — recording starts now")
 
                     recorder.start()
@@ -2845,6 +2965,7 @@ async def main() -> int:
                     await wait_in_meeting(zoom_page, max_wait=MANUAL_JOIN_WAIT_SEC)
                     await join_audio(zoom_page)
                     dismiss_browser_prompt()
+                    await set_clean_presentation_view(zoom_page)
                     await notify_photo(zoom_page, "📸 Joined the meeting - recording starts now")
 
                     recorder.start()
@@ -2852,7 +2973,7 @@ async def main() -> int:
                     step.record("1080p Recording", "🎥", f"Recording started (1080p @ 30fps) for '{ACTIVE_CLASS_TITLE}'")
                     await notify("✅ Joined class & started 1080p recording")
 
-                    await go_fullscreen(zoom_page)
+                    await set_clean_presentation_view(zoom_page)
                     end_reason = await monitor(zoom_page, started)
                     step.record("Meeting Concluded", "🏁", f"Meeting finished: {end_reason}")
                     log(f"Recording ends: {end_reason}")
@@ -2886,7 +3007,7 @@ async def main() -> int:
 
     # Upload whatever was recorded, even after an error
     out = Path(RECORD_PATH)
-    if out.exists() and out.stat().st_size > 1_000_000:
+    if out.exists() and out.stat().st_size > 50_000:
         dur = probe_duration(str(out))
         size_mb = out.stat().st_size / (1024 * 1024)
         dur_str = f"{int(dur // 60)}m {int(dur % 60)}s"
@@ -2902,7 +3023,7 @@ async def main() -> int:
         await notify("✅ Uploaded recording to Telegram")
     else:
         if not error:
-            step.record("Recording Result", "⚠️", "No valid recording was produced (>1MB)")
+            step.record("Recording Result", "⚠️", "No valid recording was produced (>50KB)")
             await notify("⚠️ Alert: no recording was produced")
         return 1
 

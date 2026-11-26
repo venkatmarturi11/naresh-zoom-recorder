@@ -39,8 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && (pip install --no-cache-dir tgcrypto==1.2.5 || echo 'tgcrypto skipped')
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Chromium enterprise policy: grant media stream permissions & disable protocol popups
 RUN mkdir -p /etc/chromium/policies/managed /etc/opt/chrome/policies/managed
