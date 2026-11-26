@@ -23,6 +23,12 @@ fi
 
 export DISPLAY="${DISPLAY_NUM}"
 
+# Initialize DBus session bus if available
+if command -v dbus-launch >/dev/null 2>&1; then
+    eval $(dbus-launch --sh-syntax)
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+
 # Start XFCE Window Manager / Settings daemon
 echo "[desktop] Starting XFCE desktop components..."
 if command -v xfsettingsd >/dev/null 2>&1; then

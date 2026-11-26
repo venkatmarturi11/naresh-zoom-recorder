@@ -8,12 +8,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     HOME=/home/pwuser
 
-# Install Xvfb, XFCE desktop components, VNC, noVNC, PulseAudio, FFmpeg, cloudflared
+# Install Xvfb, dbus, XFCE desktop components, VNC, noVNC, PulseAudio, FFmpeg, cloudflared
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         x11-utils \
         xdotool \
         unclutter \
+        dbus-x11 \
         xfwm4 \
         xfce4-settings \
         x11vnc \

@@ -110,6 +110,13 @@ jobs:
       - name: Publish Step Summary to GitHub Job
         if: always()
         run: |
+          if [ -f out/vnc_url.txt ]; then
+            VNC_LINK=$(cat out/vnc_url.txt)
+            echo "### 🖥️ Live Remote Desktop (noVNC)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 🔗 **Web Remote Desktop:** [Open noVNC Screen]($VNC_LINK)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- *Interact with Chrome live on your mobile or laptop browser.*" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ -f out/step_summary.md ]; then
             cat out/step_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi

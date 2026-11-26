@@ -44,7 +44,14 @@ if [ -f "${NOVNC_DIR}/vnc.html" ] && [ ! -f "${NOVNC_DIR}/index.html" ]; then
     ln -sf "${NOVNC_DIR}/vnc.html" "${NOVNC_DIR}/index.html" 2>/dev/null || true
 fi
 
-echo "[vnc] Starting noVNC web interface on 127.0.0.1:${NOVNC_PORT}..."
-websockify --web "$NOVNC_DIR" 127.0.0.1:"${NOVNC_PORT}" 127.0.0.1:"${VNC_PORT}" >/dev/null 2>&1 &
+echo "[vnc] Starting noVNC web interface on port ${NOVNC_PORT}..."
+websockify --web "$NOVNC_DIR" "${NOVNC_PORT}" 127.0.0.1:"${VNC_PORT}" >/tmp/websockify.log 2>&1 &
 
-echo "[vnc] noVNC ready on 127.0.0.1:${NOVNC_PORT}"
+# Wait for noVNC to bind
+for i in $(seq 1 20); do
+    if nc -z 127.0.0.1 "${NOVNC_PORT}" >/dev/null 2>&1; then
+        echo "[vnc] noVNC is ready and listening on 127.0.0.1:${NOVNC_PORT}"
+        break
+    fi
+    sleep 0.25
+done

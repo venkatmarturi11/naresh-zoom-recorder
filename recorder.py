@@ -174,6 +174,13 @@ ZOOM_COOKIES_FILE = _env("ZOOM_COOKIES_FILE")
 CF_TUNNEL_TOKEN = _env("CF_TUNNEL_TOKEN")
 VNC_PASSWORD = _env("VNC_PASSWORD")
 VNC_PUBLIC_URL = _env("VNC_PUBLIC_URL")
+if not VNC_PUBLIC_URL:
+    try:
+        vnc_txt = Path("/out/vnc_url.txt")
+        if vnc_txt.exists() and vnc_txt.stat().st_size > 0:
+            VNC_PUBLIC_URL = vnc_txt.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
 MANUAL_JOIN_WAIT_SEC = _int_env("MANUAL_JOIN_WAIT_SEC", 600)
 
 
@@ -2101,7 +2108,15 @@ async def wait_in_meeting(zp, max_wait: int = 0) -> None:
 
         if needs_human and not human_interaction_notified:
             human_interaction_notified = True
-            vnc_url = VNC_PUBLIC_URL or "http://127.0.0.1:6080"
+            vnc_url = VNC_PUBLIC_URL
+            if not vnc_url:
+                try:
+                    vnc_f = Path("/out/vnc_url.txt")
+                    if vnc_f.exists():
+                        vnc_url = vnc_f.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+            vnc_url = vnc_url or "http://127.0.0.1:6080"
             if is_bot_wall:
                 reason = "Bot verification challenge presented by Zoom"
             elif is_signin_wall:
@@ -2393,7 +2408,7 @@ async def main() -> int:
         media.start()
         step.record("Virtual Environment", "🖥️", "Virtual 1080p display (Xvfb) and PulseAudio null sink ready")
         log("Virtual display and audio are ready")
-        log("Recorder build 2026-11-25f (remote desktop vnc + manual interaction support)")
+        log("Recorder build 2026-11-26a (remote desktop vnc + manual interaction support)")
 
         prof_dir = Path("/tmp/pw-profile")
         shutil.rmtree(prof_dir, ignore_errors=True)
